@@ -31,6 +31,13 @@ fn build_hermit(src_dir: &Path, target_dir_opt: Option<&Path>) {
 			.arg("build-std=core,alloc")
 			.arg("--target")
 			.arg("aarch64-unknown-hermit");
+	} else if target.target_arch() == "riscv64" {
+		cmd.current_dir(src_dir)
+			.arg("build")
+			.arg("-Z")
+			.arg("build-std=core,alloc")
+			.arg("--target")
+			.arg("riscv64gc-unknown-hermit");
 	} else {
 		panic!("Try to build for an unsupported platform");
 	}
@@ -115,6 +122,12 @@ fn build_hermit(src_dir: &Path, target_dir_opt: Option<&Path>) {
 	} else if target.target_arch() == "aarch64" {
 		target_dir
 			.join("aarch64-unknown-hermit")
+			.join(&profile)
+			.canonicalize()
+			.unwrap() // Must exist after building
+	} else if target.target_arch() == "riscv64" {
+		target_dir
+			.join("riscv64gc-unknown-hermit")
 			.join(&profile)
 			.canonicalize()
 			.unwrap() // Must exist after building
