@@ -1,3 +1,5 @@
+#[cfg(target_arch = "riscv64")]
+use riscv::register::time;
 #[cfg(target_arch = "aarch64")]
 use aarch64::regs::*;
 #[cfg(target_arch = "x86_64")]
@@ -418,6 +420,11 @@ fn start_endpoint() -> u16 {
 #[cfg(target_arch = "aarch64")]
 fn start_endpoint() -> u16 {
 	(CNTPCT_EL0.get() % (u16::MAX as u64)).try_into().unwrap()
+}
+
+#[cfg(target_arch = "riscv64")]
+fn start_endpoint() -> u16 {
+	(time::read64() % (u16::MAX as u64)).try_into().unwrap()
 }
 
 pub fn network_init() -> Result<(), ()> {
