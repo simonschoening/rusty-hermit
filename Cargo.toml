@@ -24,3 +24,7 @@ debug = true       # controls whether the compiler passes `-C debuginfo`
 rpath = false      # controls whether the compiler passes `-C rpath`
 lto = false         # controls `-C lto` for binaries and staticlibs
 debug-assertions = true # controls whether debug assertions are enabled
+
+[patch.crates-io]
+num_cpus = { git = "https://github.com/simonschoening/num_cpus.git" }
+riscv = { git = "https://github.com/simonschoening/riscv.git" }
