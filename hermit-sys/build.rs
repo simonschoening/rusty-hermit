@@ -3,16 +3,21 @@ extern crate target_build_utils;
 extern crate walkdir;
 
 use std::env;
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "mem")]
 use std::process;
 use std::process::Command;
 use target_build_utils::TargetInfo;
 use walkdir::{DirEntry, WalkDir};
 
 fn build_hermit(src_dir: &Path, target_dir_opt: Option<&Path>) {
+	assert!(
+		src_dir.exists(),
+		"rusty_hermit source folder does not exist"
+	);
 	let target = TargetInfo::new().expect("Could not get target info");
 	let profile = env::var("PROFILE").expect("PROFILE was not set");
 	let mut cmd = Command::new("cargo");
@@ -23,7 +28,7 @@ fn build_hermit(src_dir: &Path, target_dir_opt: Option<&Path>) {
 			.arg("-Z")
 			.arg("build-std=core,alloc")
 			.arg("--target")
-			.arg("x86_64-unknown-hermit-kernel");
+			.arg("x86_64-unknown-none-hermitkernel");
 	} else if target.target_arch() == "aarch64" {
 		cmd.current_dir(src_dir)
 			.arg("build")
@@ -85,30 +90,38 @@ fn build_hermit(src_dir: &Path, target_dir_opt: Option<&Path>) {
 		cmd.arg("vga");
 	}
 
+	let mut rustflags = vec!["-Zmutable-noalias=no".to_string()];
+
 	#[cfg(feature = "instrument")]
 	{
-		cmd.env("RUSTFLAGS", "-Z instrument-mcount");
-		// if instrument is not set, ensure that instrument is not in environment variables!
-		cmd.env(
-			"RUSTFLAGS",
-			env::var("RUSTFLAGS")
-				.unwrap_or_else(|_| "".into())
-				.replace("-Z instrument-mcount", ""),
-		);
+		rustflags.push("-Zinstrument-mcount".to_string());
+		// Add outer `RUSTFLAGS` to command
+		if let Ok(var) = env::var("RUSTFLAGS") {
+			rustflags.push(var);
+		}
 	}
 
-	let output = cmd.output().expect("Unable to build kernel");
-	let stdout = std::string::String::from_utf8(output.stdout);
-	let stderr = std::string::String::from_utf8(output.stderr);
+	#[cfg(not(feature = "instrument"))]
+	{
+		// If the `instrument` feature feature is not enabled,
+		// filter it from outer `RUSTFLAGS` before adding them to the command.
+		if let Ok(var) = env::var("RUSTFLAGS") {
+			let flags = var
+				.split(',')
+				.filter(|&flag| !flag.contains("instrument-mcount"))
+				.map(String::from);
+			rustflags.extend(flags);
+		}
+	}
 
-	println!("Build libhermit-rs output-status: {}", output.status);
-	println!("Build libhermit-rs output-stdout: {}", stdout.unwrap());
-	println!("Build libhermit-rs output-stderr: {}", stderr.unwrap());
-	assert!(output.status.success());
+	cmd.env("RUSTFLAGS", rustflags.join(","));
+
+	let status = cmd.status().expect("failed to start kernel build");
+	assert!(status.success());
 
 	let lib_location = if target.target_arch() == "x86_64" {
 		target_dir
-			.join("x86_64-unknown-hermit-kernel")
+			.join("x86_64-unknown-none-hermitkernel")
 			.join(&profile)
 			.canonicalize()
 			.unwrap() // Must exist after building
@@ -123,50 +136,15 @@ fn build_hermit(src_dir: &Path, target_dir_opt: Option<&Path>) {
 	};
 	println!("Lib location: {}", lib_location.display());
 
+	let lib = lib_location.join("libhermit.a");
+
+	rename_symbol("rust_begin_unwind", &lib);
+	rename_symbol("rust_oom", &lib);
+
 	#[cfg(feature = "mem")]
 	{
-		// Kernel and user space has its own versions of memcpy, memset, etc,
-		// Consequently, we rename the functions in the libos to avoid collisions.
-		// In addition, it provides us the offer to create a optimized version of memcpy
-		// in user space.
-
-		// get access to llvm tools shipped in the llvm-tools-preview rustup component
-		let llvm_tools = match llvm_tools::LlvmTools::new() {
-			Ok(tools) => tools,
-			Err(llvm_tools::Error::NotFound) => {
-				eprintln!("Error: llvm-tools not found");
-				eprintln!("Maybe the rustup component `llvm-tools-preview` is missing?");
-				eprintln!("  Install it through: `rustup component add llvm-tools-preview`");
-				process::exit(1);
-			}
-			Err(err) => {
-				eprintln!("Failed to retrieve llvm-tools component: {:?}", err);
-				process::exit(1);
-			}
-		};
-
-		let lib = lib_location.join("libhermit.a");
-
-		let symbols: [&str; 5] = ["memcpy", "memmove", "memset", "memcmp", "bcmp"];
-		for symbol in symbols.iter() {
-			// determine llvm_objcopy
-			let llvm_objcopy = llvm_tools
-				.tool(&llvm_tools::exe("llvm-objcopy"))
-				.expect("llvm_objcopy not found in llvm-tools");
-
-			// rename symbols
-			let mut cmd = Command::new(llvm_objcopy);
-			cmd.arg("--redefine-sym")
-				.arg(String::from(*symbol) + &String::from("=kernel") + &String::from(*symbol))
-				.arg(lib.display().to_string());
-
-			println!("cmd {:?}", cmd);
-			let output = cmd.output().expect("Unable to rename symbols");
-			let stdout = std::string::String::from_utf8(output.stdout);
-			let stderr = std::string::String::from_utf8(output.stderr);
-			println!("Rename symbols output-status: {}", output.status);
-			println!("Rename symbols output-stdout: {}", stdout.unwrap());
-			println!("Rename symbols output-stderr: {}", stderr.unwrap());
+		for symbol in ["memcpy", "memmove", "memset", "memcmp", "bcmp"] {
+			rename_symbol(symbol, &lib);
 		}
 	}
 
@@ -178,6 +156,43 @@ fn build_hermit(src_dir: &Path, target_dir_opt: Option<&Path>) {
 	println!("cargo:rerun-if-env-changed=HERMIT_LOG_LEVEL_FILTER");
 }
 
+/// Kernel and user space has its own versions of panic handler, oom handler, memcpy, memset, etc,
+/// Consequently, we rename the functions in the libos to avoid collisions.
+/// In addition, it provides us the offer to create a optimized version of memcpy
+/// in user space.
+fn rename_symbol(symbol: impl AsRef<OsStr>, lib: impl AsRef<Path>) {
+	// Get access to llvm tools shipped in the llvm-tools-preview rustup component
+	let llvm_tools = match llvm_tools::LlvmTools::new() {
+		Ok(tools) => tools,
+		Err(llvm_tools::Error::NotFound) => {
+			eprintln!("Error: llvm-tools not found");
+			eprintln!("Maybe the rustup component `llvm-tools-preview` is missing?");
+			eprintln!("  Install it through: `rustup component add llvm-tools-preview`");
+			process::exit(1);
+		}
+		Err(err) => {
+			eprintln!("Failed to retrieve llvm-tools component: {:?}", err);
+			process::exit(1);
+		}
+	};
+
+	// Retrieve path of llvm-objcopy
+	let llvm_objcopy = llvm_tools
+		.tool(&llvm_tools::exe("llvm-objcopy"))
+		.expect("llvm-objcopy not found in llvm-tools");
+
+	// Rename symbols
+	let arg = IntoIterator::into_iter([symbol.as_ref(), "=kernel-".as_ref(), symbol.as_ref()])
+		.collect::<OsString>();
+	let status = Command::new(llvm_objcopy)
+		.arg("--redefine-sym")
+		.arg(arg)
+		.arg(lib.as_ref())
+		.status()
+		.expect("failed to execute llvm-objcopy");
+	assert!(status.success(), "llvm-objcopy was not sucessful");
+}
+
 #[cfg(all(not(feature = "rustc-dep-of-std"), not(feature = "with_submodule")))]
 fn build() {
 	#[cfg(windows)]
@@ -186,15 +201,21 @@ fn build() {
 	let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 	let src_dir = out_dir.join("rusty-hermit");
 
-	let _output = Command::new("cargo")
-		.current_dir(out_dir)
-		.arg("download")
-		.arg("--output")
-		.arg(src_dir.clone().into_os_string())
-		.arg("--extract")
-		.arg("rusty-hermit")
-		.output()
-		.expect("Unable to download rusty-hermit. Please install `cargo-download`.");
+	if !src_dir.as_path().exists() {
+		let status = Command::new("cargo")
+			.current_dir(out_dir)
+			.arg("download")
+			.arg("--output")
+			.arg(src_dir.clone().into_os_string())
+			.arg("--extract")
+			.arg("rusty-hermit")
+			.status()
+			.expect("failed to start kernel download");
+		assert!(
+			status.success(),
+			"Unable to download rusty-hermit. Is cargo-download installed?"
+		);
+	}
 
 	build_hermit(src_dir.as_ref(), None);
 }
@@ -202,7 +223,7 @@ fn build() {
 #[cfg(all(not(feature = "rustc-dep-of-std"), feature = "with_submodule"))]
 fn build() {
 	let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-	let target_dir = out_dir.clone().join("target");
+	let target_dir = out_dir.join("target");
 	let src_dir = env::current_dir()
 		.unwrap()
 		.parent()

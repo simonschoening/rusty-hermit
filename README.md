@@ -152,24 +152,6 @@ qemu-system-x86_64 ... -append "kernel-arguments -- application-arguments"
 
 You are not happy with `Hello World` yet?
 
-### Link Time Optimization (LTO)
-
-To enable *Link Time Optimization* (LTO), please extend the release configuration in *Cargo.toml* as follows:
-
-```toml
-# Cargo.toml
-[profile.release]
-opt-level = 3
-lto = "thin"
-```
-
-In addition, the [Linker-plugin LTO](https://doc.rust-lang.org/rustc/linker-plugin-lto.html) have to be enabled by setting the compiler flag `linker-plugin-lto`.
-In this case, the release version have to build as follows:
-
-```sh
-RUSTFLAGS="-Clinker-plugin-lto" cargo build -Z build-std=std,core,alloc,panic_abort --target x86_64-unknown-hermit --release
-```
-
 ### Controlling kernel message verbosity
 
 RustyHermit uses the lightweight logging crate [log](https://github.com/rust-lang/log) to print kernel messages.
@@ -196,12 +178,12 @@ sudo bash -c 'echo 1 > /proc/sys/net/ipv4/conf/tap10/proxy_arp'
 ```
 
 Add the feature `smoltcp` in the `Cargo.toml`. This includes the network stack [smoltcp](https://github.com/smoltcp-rs/smoltcp) and offers TCP/UDP communication.
-
+`hermi-sys` dependency has to be factored out of `[target.'cfg(target_os = "hermit")'.dependencies]` because it requires features selection for network support to work thus this snippet should be added to `Cargo.toml` 
 ```toml
 # Cargo.toml
 
-[target.'cfg(target_os = "hermit")'.dependencies]
-hermit-sys = "0.1.*"
+[target.'cfg(target_os = "hermit")'.dependencies.hermit-sys]
+version = "0.1.*"
 default-features = false
 features = ["smoltcp"]
 ```
