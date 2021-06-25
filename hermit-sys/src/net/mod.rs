@@ -32,6 +32,18 @@ use crate::net::device::HermitNet;
 use crate::net::executor::{block_on, spawn};
 use crate::net::waker::WakerRegistration;
 
+use hermit_abi::io;
+
+// reduce boilerplate and convieniently use std::io:Error everywhere
+macro_rules! IOError {
+    ($kind:ident, $msg:literal) => {
+        hermit_abi::io::Error {
+            kind: hermit_abi::io::ErrorKind::$kind,
+            msg: $msg,
+        }
+    }
+}
+
 pub(crate) enum NetworkState {
 	Missing,
 	InitializationFailed,
@@ -39,6 +51,36 @@ pub(crate) enum NetworkState {
 }
 
 static mut NIC: NetworkState = NetworkState::Missing;
+
+impl NetworkState {
+    pub fn with<F,R>(&mut self, f: F) -> Result<R,io::Error> 
+    where
+        F: FnOnce(&mut NetworkInterface<HermitNet>) -> Result<R,io::Error>,
+    {
+		match self {
+			NetworkState::Initialized(nic) => {
+				let mut guard = nic.lock()
+                        .map_err(|_| IOError!(Other,"Network Interface Poisoned"))?;
+                let ret = f(&mut* guard);
+                guard.wake();
+                ret
+			}
+			_ => {
+                Err(IOError!(NotFound,"Network Interface not found"))
+			}
+		}
+    }
+
+    pub fn with_tcp<F,R>(&mut self, handle: SocketHandle, f: F) -> io::Result<R>
+    where
+        F: FnOnce(&mut TcpSocket) -> Result<R,io::Error>,
+    {
+        self.with(|nic| {
+            let mut socket = nic.sockets.get::<TcpSocket>(handle);
+            f(&mut* socket)
+        })
+    }
+}
 
 extern "C" {
 	fn sys_yield();
@@ -168,26 +210,21 @@ impl AsyncSocket {
 		}
 	}
 
-	fn with<R>(&self, f: impl FnOnce(&mut TcpSocket) -> R) -> R {
-		let mut guard = match unsafe { &mut NIC } {
-			NetworkState::Initialized(nic) => nic.lock().unwrap(),
-			_ => {
-				panic!("Network isn't initialized!");
-			}
-		};
-		let res = {
-			let mut s = guard.sockets.get::<TcpSocket>(self.0);
-			f(&mut *s)
-		};
-		guard.wake();
-		res
+	fn with<R>(&self, f: impl FnOnce(&mut TcpSocket) -> R) -> R 
+    {
+        unsafe {
+            NIC.with_tcp(
+                self.0, 
+                |socket| Ok(f(&mut* socket))
+            ).unwrap()
+        }
 	}
 
 	pub(crate) async fn connect(&self, ip: &[u8], port: u16) -> Result<Handle, Error> {
-		let address = IpAddress::from_str(std::str::from_utf8(ip).map_err(|_| Error::Illegal)?)
-			.map_err(|_| Error::Illegal)?;
+        let address = IpAddress::from_str(std::str::from_utf8(ip).map_err(|_| Error::Illegal)?)
+            .map_err(|_| Error::Illegal)?;
 
-		self.with(|s| {
+		self.with(|s: &mut TcpSocket| {
 			s.connect(
 				(address, port),
 				LOCAL_ENDPOINT.fetch_add(1, Ordering::SeqCst),
@@ -414,9 +451,171 @@ pub(crate) fn network_init() -> Result<(), ()> {
 	Ok(())
 }
 
+///////////////////////////////////////////////////////////////////
+// new interface
+///////////////////////////////////////////////////////////////////
+
+use hermit_abi::net::{
+    self,
+    Socket, SocketType, SocketCmd, SocketAddr,
+    TcpCmd, TcpInfo, 
+    IpAddr, Ipv4Addr, Ipv6Addr
+};
+
+// I'm missing conversion traits from abi to std so this is 
+// needed until AsAbi, IntoAbi and FromAbi are added to std.
+// I'll add them once I get to editing std to be able to
+// add hermit support into tokio-rs/mio which also needs these
+// traits to be properly implemented
+macro_rules! abi_to_std {
+    ($expr:expr => SocketAddr) => {
+        match $expr {
+            SocketAddr::V4(addr) => {
+                let ip = addr.ip_addr;
+                let std_ip = std::net::Ipv4Addr::new(
+                    ip.a,ip.b,ip.c,ip.d);
+                let socket_addr = std::net::SocketAddrV4::new(
+                    std_ip,addr.port);
+                std::net::SocketAddr::from(socket_addr)
+            },
+            SocketAddr::V6(addr) => {
+                let ip = addr.ip_addr;
+                let std_ip = std::net::Ipv6Addr::new(
+                    ip.a,ip.b,ip.c,ip.d,ip.e,ip.f,ip.g,ip.h);
+                let socket_addr = std::net::SocketAddrV6::new(
+                    std_ip,addr.port,addr.flowinfo,addr.scope_id);
+                std::net::SocketAddr::from(socket_addr)
+            },
+        }
+    };
+    ($expr:expr => IpAddr) => {
+        match $expr {
+            IpAddr::V4(ip) => {
+                let std_ip = std::net::Ipv4Addr::new(
+                    ip.a,ip.b,ip.c,ip.d);
+                std::net::IpAddr::from(std_ip)
+            },
+            IpAddr::V6(ip) => {
+                let std_ip = std::net::Ipv6Addr::new(
+                    ip.a,ip.b,ip.c,ip.d,ip.e,ip.f,ip.g,ip.h);
+                std::net::IpAddr::from(std_ip)
+            },
+        }
+    }
+}
+
+/// creates a new socket (TCP/UDP/...)
+#[no_mangle]
+pub fn sys_socket(cmd: SocketCmd<'_>)
+    -> Result<Socket,io::Error> 
+{
+    match cmd {
+        SocketCmd::Create(socket_type) => match socket_type {
+            SocketType::Tcp(..) => Ok( move |nic: &mut NetworkInterface<_>| { 
+                let handle = nic.create_handle().unwrap();
+                Ok(Socket { handle, socket_type })
+            }),
+            _ => Err(IOError!(InvalidInput, "Unsupported Socket Type")),
+        },
+        _ => Err(IOError!(InvalidInput, "Unsupported Command")),
+    }
+    .and_then(|f| unsafe { NIC.with(f) } ) 
+}
+
+/// change tcp socket properties
+///
+/// one should close the provided socket if this function returns Err(..)
+#[no_mangle] 
+pub fn sys_tcp(socket: &mut Socket, cmd: TcpCmd) -> Result<(), io::Error> {
+    let info = if let SocketType::Tcp(info) = socket.socket_type {
+        Ok(info) } else { Err(IOError!(InvalidInput, "Not a tcp socket")) }?;
+
+    match cmd {
+        // Listen for incoming connection specified by the associated tcpinfo
+        TcpCmd::Listen =>
+            Ok( |nic: &mut NetworkInterface<_>| {
+                let mut tcp_socket = nic.sockets.get::<TcpSocket>(socket.handle.clone());
+                let local_endpoint: smoltcp::wire::IpEndpoint = 
+                    abi_to_std!(info.addr => SocketAddr).into();
+                tcp_socket
+                    .listen(local_endpoint)
+                    .map_err(|err| match err {
+                        Error::Unaddressable => IOError!(InvalidInput, "port was zero"),
+                        Error::Illegal => IOError!(InvalidInput, "already open"),
+                        _ => IOError!(Other, "unknown error"),
+                    })
+            }),
+        _ => Err(IOError!(InvalidInput, "Unsupported Command Type")),
+    }
+    .and_then(|f| unsafe { NIC.with(f) } ) 
+}
+
+#[no_mangle]
+pub fn sys_tcp_connect(socket: &Socket, remote: SocketAddr) -> Result<(), io::Error> {
+    let info = if let SocketType::Tcp(info) = socket.socket_type {
+        Ok(info) 
+    } else { Err(IOError!(InvalidInput, "Not a tcp socket")) }?;
+
+    let local = abi_to_std!(info.addr => SocketAddr);
+    let remote = abi_to_std!(remote => SocketAddr);
+
+    unsafe {
+        NIC.with_tcp(socket.handle, |socket: &mut TcpSocket| 
+            socket.connect(remote, local)
+            .map_err(|_| IOError!(InvalidInput, "invalid remote"))
+        )?
+    }
+
+    let connect = future::poll_fn(|cx| unsafe { 
+        NIC.with_tcp(
+            socket.handle, 
+            |socket: &mut TcpSocket| match socket.state() {
+                TcpState::Closed | TcpState::TimeWait 
+                    => Err(IOError!(NotFound, "address not responding")),
+                TcpState::Listen 
+                    => Err(IOError!(Other,"connecting socket is now listening")),
+                TcpState::SynSent | TcpState::SynReceived => {
+                    socket.register_send_waker(cx.waker());
+                    Ok(Poll::Pending)
+                },
+                _ => Ok(Poll::Ready(Ok(()))),
+            }
+        ).unwrap_or_else(|err| Poll::Ready(Err(err)))
+    });
+
+    block_on(connect, None)
+        .expect("executor error without timeout") 
+}
+
+#[no_mangle]
+pub fn sys_tcp_accept(socket: &Socket) -> Result<Socket,io::Error> {
+    Err(IOError!(InvalidInput, "Unimplemented"))
+}
+
+#[no_mangle] 
+pub fn sys_tcp_read(socket: &Socket, buf: &mut [u8]) -> Result<usize,io::Error> {
+    let socket = AsyncSocket::from(socket.handle);
+	block_on(socket.read(buf), None)
+        .map_err(|_| IOError!(TimedOut, "async executor timeout"))?
+        .map_err(|_| IOError!(Other, "read failed"))
+}
+
+#[no_mangle] 
+pub fn sys_tcp_write(socket: Socket, buf: &[u8]) -> Result<usize, io::Error> {
+    let socket = AsyncSocket::from(socket.handle);
+	block_on(socket.write(buf), None)
+        .map_err(|_| IOError!(TimedOut, "async executor timeout"))?
+        .map_err(|_| IOError!(Other, "read failed"))
+}
+
+///////////////////////////////////////////////////////////////////
+// old interface
+///////////////////////////////////////////////////////////////////
+
 #[no_mangle]
 pub fn sys_tcp_stream_connect(ip: &[u8], port: u16, timeout: Option<u64>) -> Result<Handle, ()> {
 	let socket = AsyncSocket::new();
+
 	block_on(
 		socket.connect(ip, port),
 		timeout.map(|ms| Duration::from_millis(ms)),

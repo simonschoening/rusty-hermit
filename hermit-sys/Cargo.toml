@@ -22,6 +22,7 @@ fsgsbase = []
 pci = []
 acpi = []
 vga = []
+net = ["smoltcp","hermit-abi/net"]
 dhcpv4 = ["smoltcp/proto-dhcpv4"]
 # only for internal usage, please don't use it
 with_submodule = []
@@ -39,6 +40,7 @@ async-task = "4.0"
 concurrent-queue = "1.2"
 futures-lite = "1.11"
 lazy_static = "1.4"
+hermit-abi = { path = "../hermit-abi", default-features = false ,features = ["net"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies.x86]
 version = "0.*"
