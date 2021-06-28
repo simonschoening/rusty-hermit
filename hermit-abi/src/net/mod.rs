@@ -1,9 +1,9 @@
 // include bindings to hermit-sys if not internally used
 
-#[cfg(not(feature = "internal"))]
+#[cfg(feature = "bindings")]
 mod bindings;
 
-#[cfg(not(feature = "internal"))]
+#[cfg(feature = "bindings")]
 pub use bindings::*;
 
 // networking primitives
