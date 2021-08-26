@@ -2,6 +2,9 @@
 //! [RustyHermit](https://github.com/hermitcore/libhermit-rs).
 
 #![no_std]
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::result_unit_err)]
+
 extern crate libc;
 
 pub mod tcplistener;
@@ -116,7 +119,7 @@ pub fn isatty(_fd: libc::c_int) -> bool {
 	false
 }
 
-/// intialize the network stack
+/// initialize the network stack
 pub fn network_init() -> i32 {
 	unsafe { sys_network_init() }
 }
