@@ -1,43 +1,71 @@
-use crate::net::{Socket, SocketCmd, SocketAddr, TcpCmd, TcpInfo};
+use crate::net::{Socket, SocketAddr, SocketInfo};
 use crate::io::Result;
 //use crate::event::{Interest, Event};
 
 extern "Rust" {
-    fn sys_socket<'a>(cmd: SocketCmd<'a>) 
+// Socket
+    fn sys_socket(info: SocketInfo) 
         -> Result<Socket>;
-    fn sys_tcp(socket: &mut Socket, cmd: TcpCmd) 
-        -> Result<()>;
-    fn sys_tcp_accept(socket: &Socket) 
+    fn sys_socket_dup(socket: Socket) 
         -> Result<Socket>;
-    fn sys_tcp_connect(socket: &Socket, remote: SocketAddr) 
+    fn sys_socket_update(socket: Socket, info: Option<SocketInfo>) 
+        -> Result<SocketInfo>;
+    fn sys_socket_close(socket: Socket) 
         -> Result<()>;
-    fn sys_tcp_read(socket: &Socket, buf: &mut [u8]) 
+//    fn sys_socket_wait(socket: Socket, interest: Interest, timeout: time::Duration) 
+//        -> Result<Event, io::Error>;
+
+// TCP
+    fn sys_tcp_listen(socket: Socket) 
+        -> Result<()>;
+    fn sys_tcp_accept(socket: Socket) 
+        -> Result<Socket>;
+    fn sys_tcp_connect(socket: Socket, remote: SocketAddr) 
+        -> Result<()>;
+    fn sys_tcp_shutdown(socket: Socket) 
+        -> Result<()>;
+    fn sys_tcp_read(socket: Socket, buf: &mut [u8]) 
         -> Result<usize>;
-    fn sys_tcp_write(socket: &Socket, buf: &[u8]) 
+    fn sys_tcp_write(socket: Socket, buf: &[u8]) 
         -> Result<usize>;
-//    fn sys_tcp_wait(socket: Socket, interest: Interest, timeout: time::Duration) -> Result<Event, io::Error>;
 }
 
-pub fn socket(cmd: SocketCmd) -> Result<Socket> {
-    unsafe { sys_socket(cmd) }
+pub fn socket(info: SocketInfo) -> Result<Socket> {
+    unsafe { sys_socket(info) }
 }
 
-pub fn tcp(socket: &mut Socket, cmd: TcpCmd) -> Result<()> {
-    unsafe { sys_tcp(socket, cmd) }
+pub fn socket_dup(socket: Socket) -> Result<Socket> {
+    unsafe { sys_socket_dup(socket) }
 }
 
-pub fn tcp_accept(socket: &Socket) -> Result<Socket> {
+pub fn socket_update(socket: Socket, info: Option<SocketInfo>) -> Result<SocketInfo> {
+    unsafe { sys_socket_update(socket, info) }
+}
+
+pub fn socket_close(socket: Socket) -> Result<()> {
+    unsafe { sys_socket_close(socket) }
+}
+
+pub fn tcp_listen(socket: Socket) -> Result<()> {
+    unsafe { sys_tcp_listen(socket) }
+}
+
+pub fn tcp_accept(socket: Socket) -> Result<Socket> {
     unsafe { sys_tcp_accept(socket) }
 }
 
-pub fn tcp_connect(socket: &Socket, remote: SocketAddr) -> Result<()> {
+pub fn tcp_connect(socket: Socket, remote: SocketAddr) -> Result<()> {
     unsafe { sys_tcp_connect(socket, remote) }
 }
 
-pub fn tcp_read(socket: &Socket, buf: &mut [u8]) -> Result<usize> {
+pub fn tcp_shutdown(socket: Socket, remote: SocketAddr) -> Result<()> {
+    unsafe { sys_tcp_shutdown(socket) }
+}
+
+pub fn tcp_read(socket: Socket, buf: &mut [u8]) -> Result<usize> {
     unsafe { sys_tcp_read(socket, buf) }
 }
 
-pub fn tcp_write(socket: &Socket, buf: &[u8]) -> Result<usize> {
+pub fn tcp_write(socket: Socket, buf: &[u8]) -> Result<usize> {
     unsafe { sys_tcp_write(socket, buf) }
 }

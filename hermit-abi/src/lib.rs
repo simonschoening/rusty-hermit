@@ -6,17 +6,19 @@
 #![allow(clippy::result_unit_err)]
 
 extern crate libc;
-
 extern crate core;
 
+// legacy networking (consider marking as deprecated)
 #[cfg(feature = "bindings")]
 pub mod tcplistener;
 #[cfg(feature = "bindings")]
 pub mod tcpstream;
 
+/// networking primitives
 #[cfg(feature = "net")]
 pub mod net;
 
+/// hermit io types
 pub mod io;
 
 #[cfg(feature = "bindings")]
@@ -34,14 +36,6 @@ pub const NO_PRIORITIES: usize = 31;
 /// Priority of a thread
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
 pub struct Priority(u8);
-
-pub fn has_net() -> bool {
-    cfg![feature = "net"]
-}
-
-pub fn is_bindings() -> bool {
-    cfg![bindings = "bindings"]
-}
 
 impl Priority {
 	pub const fn into(self) -> u8 {

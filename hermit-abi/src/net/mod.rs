@@ -2,75 +2,36 @@
 
 #[cfg(feature = "bindings")]
 mod bindings;
-
 #[cfg(feature = "bindings")]
 pub use bindings::*;
 
+// event types
+pub mod event;
+
 // networking primitives
 
-/// Handle to internal Socket
-///
-/// this is currently dependent on smoltcp since a SocketHandle 
-/// is not convertible to the underlying usize
-///
-/// Solutions to this could be:
-/// 1.  amend smoltcp (e.g. by adding function to SocketHandle)
-/// 2.  replicate a Handle of similar layout, like the one currently defined
-///     in this crate. 
-///     BUT: This is incredibly unsafe/undefined since Rust makes no guarantees
-///          about the representation of structs and it may lead to strange behaviour
-///          if smoltcp changes
-pub type Handle = smoltcp::socket::SocketHandle;
-
-/// Socket with enum for Information
-#[derive(Debug, PartialEq, Eq)]
+/// Socket type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Socket {
     /// Handle indentifying internal socket
-    pub handle: Handle,
-    /// Type of the Socket (TCP/UDP/..)
-    pub socket_type: SocketType,
+    pub id: usize,
 }
 
-/// Information about a TcpSocket
-/// used to define behaviour of some 
-/// sys functions like blocking on read/write
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TcpInfo {
-    /// addr of local socket
-    pub addr: SocketAddr,
-    // if event is Some, io is non_blocking
-//    pub event: Option<Event>
+/// used to modify and query data from OS Sockets
+#[derive(Debug,Clone)]
+pub struct SocketInfo {
+    pub socket_addr: SocketAddr,
+    pub socket_type: SocketType,
+    pub non_blocking: bool,
 }
 
 /// Type of a Socket with appended information
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketType {
     /// tcp socket with info
-    Tcp(TcpInfo),
+    Tcp,
     /// udp socket
     Udp,
-}
-
-/// Commands to be used with sys_socket
-#[derive(Debug, PartialEq, Eq)]
-pub enum SocketCmd<'a> {
-    /// create Socket from Type
-    Create(SocketType),
-    /// duplicate Socket from Reference
-    Dup(&'a Socket),
-    /// Close and consume socket
-    Close(Socket),
-}
-
-/// Commands to be used with sys_tcp
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TcpCmd {
-    /// make socket listen for connections
-    Listen,
-    /// shutdown part of a connection
-    Shutdown,
-    /// update the internals based on tcpinfo
-    Update,
 }
 
 // replicate std::net types since they are not included in core
