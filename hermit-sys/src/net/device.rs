@@ -81,10 +81,10 @@ impl NetworkInterface<HermitNet> {
 		info!("MAC address {}", ethernet_addr);
 		info!("MTU: {} bytes", mtu);
 
-		let mut sockets = SocketSet::new(vec![]);
+		let mut socket_set = SocketSet::new(vec![]);
 		let dhcp_rx_buffer = RawSocketBuffer::new([RawPacketMetadata::EMPTY; 1], vec![0; 900]);
 		let dhcp_tx_buffer = RawSocketBuffer::new([RawPacketMetadata::EMPTY; 1], vec![0; 600]);
-		let dhcp = Dhcpv4Client::new(&mut sockets, dhcp_rx_buffer, dhcp_tx_buffer, Instant::now());
+		let dhcp = Dhcpv4Client::new(&mut socket_set, dhcp_rx_buffer, dhcp_tx_buffer, Instant::now());
 		let prev_cidr = Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0);
 
 		let iface = EthernetInterfaceBuilder::new(device)
@@ -96,8 +96,9 @@ impl NetworkInterface<HermitNet> {
 
 		NetworkState::Initialized(Mutex::new(Self {
 			iface,
-			sockets,
+			socket_set,
 			dhcp,
+            socket_map: std::collections::HashMap::new(),
 			prev_cidr,
 			waker: WakerRegistration::new(),
 		}))
@@ -170,7 +171,8 @@ impl NetworkInterface<HermitNet> {
 
 		NetworkState::Initialized(Mutex::new(Self {
 			iface,
-			sockets: SocketSet::new(vec![]),
+			socket_set: SocketSet::new(vec![]),
+            socket_map: std::collections::HashMap::new(),
 			waker: WakerRegistration::new(),
 		}))
 	}

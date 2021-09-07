@@ -11,6 +11,8 @@ use std::{
 	task::{Context, Poll, Wake},
 };
 
+use hermit_abi::io;
+
 /// A thread handle type
 type Tid = u32;
 
@@ -29,19 +31,30 @@ lazy_static! {
 	static ref QUEUE: ConcurrentQueue<Runnable> = ConcurrentQueue::unbounded();
 }
 
-fn run_executor() {
+pub(crate) fn run_executor() {
+    // execute all futures and reschedule them
+    // ToDo: don't wake every Runnable immediatly
+    //          -> mark futures safe to be detached, if they 
+    //             register a waker before Pending 
+    let mut wake_buf = Vec::with_capacity(QUEUE.len());
 	while let Ok(runnable) = QUEUE.pop() {
+        wake_buf.push(runnable.waker());
+        debug!("running future");
 		runnable.run();
 	}
+    for waker in wake_buf { waker.wake() };
 }
 
 /// Spawns a future on the executor.
-pub fn spawn<F, T>(future: F) -> Task<T>
+pub(crate) fn spawn<F, T>(future: F) -> Task<T>
 where
 	F: Future<Output = T> + Send + 'static,
 	T: Send + 'static,
 {
-	let schedule = |runnable| QUEUE.push(runnable).unwrap();
+	let schedule = |runnable| { 
+        debug!("rescheduling future");
+        QUEUE.push(runnable).unwrap() 
+    };
 	let (runnable, task) = async_task::spawn(future, schedule);
 	runnable.schedule();
 	task
@@ -86,7 +99,7 @@ impl Wake for ThreadNotify {
 }
 
 /// Blocks the current thread on `f`, running the executor when idling.
-pub fn block_on<F, T>(future: F, timeout: Option<Duration>) -> Result<T, ()>
+pub fn block_on<F, T>(future: F, timeout: Option<Duration>) -> io::Result<T>
 where
 	F: Future<Output = T>,
 {
@@ -102,6 +115,7 @@ where
 		let mut cx = Context::from_waker(&waker);
 		pin!(future);
 		loop {
+            debug!("polling blocking future");
 			if let Poll::Ready(t) = future.as_mut().poll(&mut cx) {
 				unsafe { sys_set_network_polling_mode(false) }
 				return Ok(t);
@@ -110,27 +124,29 @@ where
 			if let Some(duration) = timeout {
 				if Instant::now() >= start + duration {
 					unsafe { sys_set_network_polling_mode(false) }
-					return Err(());
-				}
-			} else {
-				let delay = network_delay(Instant::now()).map(|d| d.total_millis());
-
-				if delay.is_none() || delay.unwrap() > 100 {
-					let unparked = thread_notify.unparked.swap(false, Ordering::Acquire);
-					if !unparked {
-						unsafe {
-							sys_set_network_polling_mode(false);
-							sys_block_current_task_with_timeout(delay);
-							sys_yield();
-							sys_set_network_polling_mode(true);
-						}
-						thread_notify.unparked.store(false, Ordering::Release);
-						run_executor()
-					}
-				} else {
-					run_executor()
+					return Err(io::Error { kind: io::ErrorKind::TimedOut, msg: "executor timed out" });
 				}
 			}
+
+            debug!("running executor");
+            run_executor();
+
+            debug!("polling network");
+            let delay = network_delay(start).map(|d| d.total_millis());
+
+            if delay.is_some() && delay.unwrap() > 100 {
+                let unparked = thread_notify.unparked.swap(false, Ordering::Acquire);
+                if !unparked {
+                    unsafe {
+                        sys_set_network_polling_mode(false);
+                        debug!("blocking for delay: {:?}", delay);
+                        sys_block_current_task_with_timeout(delay.map(|d| d-100));
+                        sys_yield();
+                        sys_set_network_polling_mode(true);
+                    }
+                    thread_notify.unparked.store(false, Ordering::Release);
+                } else { debug!("not running executor") }
+            }
 		}
 	})
 }
