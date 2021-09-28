@@ -20,7 +20,9 @@ fn build_hermit(src_dir: &Path, target_dir_opt: Option<&Path>) {
 	);
 	let target = TargetInfo::new().expect("Could not get target info");
 	let profile = env::var("PROFILE").expect("PROFILE was not set");
-	let mut cmd = Command::new("cargo");
+	let mut cmd = Command::new(env!("CARGO"));
+
+	cmd.env("CARGO_TERM_COLOR", "always");
 
 	if target.target_arch() == "x86_64" {
 		cmd.current_dir(src_dir)
@@ -54,6 +56,11 @@ fn build_hermit(src_dir: &Path, target_dir_opt: Option<&Path>) {
 
 	// disable all default features
 	cmd.arg("--no-default-features");
+
+	if target.target_arch() == "aarch64" {
+		cmd.arg("--features");
+		cmd.arg("aarch64-qemu-stdout");
+	}
 
 	// do we have to enable PCI support?
 	#[cfg(feature = "pci")]
@@ -91,30 +98,29 @@ fn build_hermit(src_dir: &Path, target_dir_opt: Option<&Path>) {
 	}
 
 	let mut rustflags = vec!["-Zmutable-noalias=no".to_string()];
+	let outer_rustflags = env::var("CARGO_ENCODED_RUSTFLAGS").unwrap();
 
 	#[cfg(feature = "instrument")]
 	{
 		rustflags.push("-Zinstrument-mcount".to_string());
-		// Add outer `RUSTFLAGS` to command
-		if let Ok(var) = env::var("RUSTFLAGS") {
-			rustflags.push(var);
-		}
+		// Add outer rustflags to command
+		rustflags.push(outer_rustflags);
 	}
 
 	#[cfg(not(feature = "instrument"))]
 	{
 		// If the `instrument` feature feature is not enabled,
-		// filter it from outer `RUSTFLAGS` before adding them to the command.
-		if let Ok(var) = env::var("RUSTFLAGS") {
-			let flags = var
-				.split(',')
+		// filter it from outer rustflags before adding them to the command.
+		if !outer_rustflags.is_empty() {
+			let flags = outer_rustflags
+				.split('\x1f')
 				.filter(|&flag| !flag.contains("instrument-mcount"))
 				.map(String::from);
 			rustflags.extend(flags);
 		}
 	}
 
-	cmd.env("RUSTFLAGS", rustflags.join(","));
+	cmd.env("CARGO_ENCODED_RUSTFLAGS", rustflags.join("\x1f"));
 
 	let status = cmd.status().expect("failed to start kernel build");
 	assert!(status.success());
@@ -151,8 +157,7 @@ fn build_hermit(src_dir: &Path, target_dir_opt: Option<&Path>) {
 	println!("cargo:rustc-link-search=native={}", lib_location.display());
 	println!("cargo:rustc-link-lib=static=hermit");
 
-	//HERMIT_LOG_LEVEL_FILTER sets the log level filter at compile time
-	// Doesn't actually rebuild atm - see: https://github.com/rust-lang/cargo/issues/8306
+	// HERMIT_LOG_LEVEL_FILTER sets the log level filter at compile time
 	println!("cargo:rerun-if-env-changed=HERMIT_LOG_LEVEL_FILTER");
 }
 
@@ -190,7 +195,7 @@ fn rename_symbol(symbol: impl AsRef<OsStr>, lib: impl AsRef<Path>) {
 		.arg(lib.as_ref())
 		.status()
 		.expect("failed to execute llvm-objcopy");
-	assert!(status.success(), "llvm-objcopy was not sucessful");
+	assert!(status.success(), "llvm-objcopy was not successful");
 }
 
 #[cfg(all(not(feature = "rustc-dep-of-std"), not(feature = "with_submodule")))]
@@ -202,7 +207,7 @@ fn build() {
 	let src_dir = out_dir.join("rusty-hermit");
 
 	if !src_dir.as_path().exists() {
-		let status = Command::new("cargo")
+		let status = Command::new(env!("CARGO"))
 			.current_dir(out_dir)
 			.arg("download")
 			.arg("--output")

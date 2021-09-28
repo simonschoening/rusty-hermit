@@ -169,12 +169,12 @@ impl NetworkInterface<HermitNet> {
 			.routes(routes)
 			.finalize();
 
-		NetworkState::Initialized(Mutex::new(Self {
+		NetworkState::Initialized(Self {
 			iface,
 			socket_set: SocketSet::new(vec![]),
             socket_map: std::collections::HashMap::new(),
 			waker: WakerRegistration::new(),
-		}))
+		})
 	}
 }
 

@@ -8,6 +8,7 @@ use aarch64::regs::*;
 use std::arch::x86_64::_rdtsc;
 use std::convert::TryInto;
 use std::collections::HashMap;
+use std::ops::DerefMut;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -22,6 +23,7 @@ mod smol {
     #[cfg(feature = "trace")]
     pub use smoltcp::phy::EthernetTracer;
 
+    pub use smoltcp::iface::EthernetInterface;
     pub use smoltcp::phy::Device;
     pub use smoltcp::time::{Duration, Instant};
     pub use smoltcp::wire::{IpAddress,IpEndpoint};
@@ -38,7 +40,7 @@ use hermit_abi::io;
 use futures_lite::future;
 
 use crate::net::device::HermitNet;
-use crate::net::executor::{block_on, spawn, run_executor};
+use crate::net::executor::{poll_on as block_on, spawn, run_executor};
 use crate::net::waker::WakerRegistration;
 
 macro_rules! abi_to_smol {
@@ -93,43 +95,23 @@ macro_rules! IOError {
 pub(crate) enum NetworkState {
 	Missing,
 	InitializationFailed,
-	Initialized(Mutex<NetworkInterface<HermitNet>>),
+	Initialized(NetworkInterface<HermitNet>),
 }
 
-static mut NIC: NetworkState = NetworkState::Missing;
-
 impl NetworkState {
-    pub fn with<F,R>(&self, f: F) -> Result<R,io::Error> 
+    pub fn with<F,R>(&mut self, f: F) -> io::Result<R> 
     where
-        F: FnOnce(&mut NetworkInterface<HermitNet>) -> Result<R,io::Error>,
+        F: FnOnce(&mut NetworkInterface<HermitNet>) -> io::Result<R>,
     {
 		match self {
-			NetworkState::Initialized(nic) => {
-				let mut guard = nic.lock()
-                    .map_err(|_| IOError!(Other,"Network Interface Poisoned"))?;
-                f(&mut* guard)
-			}
-			_ => {
-                Err(IOError!(NotFound,"Network Interface not found"))
-			}
+			NetworkState::Initialized(nic) => f(nic),
+			_ => Err(IOError!(NotFound,"Network Interface not found")),
 		}
     }
+}
 
-    pub fn try_with<F,R>(&self, f: F) -> Result<R,io::Error> 
-    where
-        F: FnOnce(&mut NetworkInterface<HermitNet>) -> Result<R,io::Error>,
-    {
-		match self {
-			NetworkState::Initialized(nic) => {
-				let mut guard = nic.try_lock()
-                    .map_err(|_| IOError!(WouldBlock,"Network Interface locked"))?;
-                f(&mut* guard)
-			}
-			_ => {
-                Err(IOError!(NotFound,"Network Interface not found"))
-			}
-		}
-    }
+lazy_static! {
+	static ref NIC: Mutex<NetworkState> = Mutex::new(NetworkState::Missing);
 }
 
 extern "C" {
@@ -159,9 +141,9 @@ pub(crate) struct MapEntry {
 
 pub(crate) struct NetworkInterface<T: for<'a> smol::Device<'a>> {
 	#[cfg(feature = "trace")]
-	pub iface: smoltcp::iface::EthernetInterface<'static, EthernetTracer<T>>,
+	pub iface: smol::EthernetInterface<'static, EthernetTracer<T>>,
 	#[cfg(not(feature = "trace"))]
-	pub iface: smoltcp::iface::EthernetInterface<'static, T>,
+	pub iface: smol::EthernetInterface<'static, T>,
 	pub socket_set: smol::SocketSet<'static>,
     pub socket_map: HashMap<abi::Socket,MapEntry>,
     //pub event_map: HashMap<abi::Socket,Arc<Mutex<Vec<abi::event::Event>>>>,
@@ -224,21 +206,22 @@ where
             .ok_or(IOError!(InvalidInput, "Unknown Socket"))
     }
 
-    pub(crate) fn release(&mut self, socket: abi::Socket) -> io::Result<MapEntry> {
-        self.socket_map.get_mut(&socket)
+    pub(crate) fn release(&mut self, socket: abi::Socket) -> io::Result<()> {
+        let mut remove_socket = false;
+        self.socket_map
+            .get_mut(&socket)
             .map(|entry| {
                 if entry.ref_count > 0 { 
                     entry.ref_count -= 1;
-                } else { panic!("internal error in NIC's socket_map") }
-                entry.clone()
-            })
-            .map(|entry| {
-                if entry.ref_count == 0 {
-                   self.remove(socket);
+                } else { 
+                    remove_socket = true;
                 }
-                entry
             })
-            .ok_or(IOError!(InvalidInput, "Unknown Socket"))
+            .ok_or(IOError!(InvalidInput, "Unknown Socket"))?;
+                    
+            if remove_socket { self.remove(socket)?; }
+
+            Ok(())
     }
 
     pub(crate) fn create_tcp(&mut self, info: abi::SocketInfo) -> io::Result<abi::Socket> {
@@ -341,26 +324,35 @@ impl AsyncTcpSocket {
     where
         F: FnOnce(&mut smol::TcpSocket) -> R
     {
-        unsafe {
-            NIC.with(|nic| {
+        NIC
+            .lock()
+            .unwrap()
+            .with(|nic| {
                 let ret = nic.with_socket(self.handle,f);
                 nic.wake();
                 Ok(ret)
-            }).unwrap()
-        }
+            })
+            .unwrap()
 	}
 
 	fn try_with<F,R>(&self, f: F) -> io::Result<R> 
     where
         F: FnOnce(&mut smol::TcpSocket) -> R
     {
-        unsafe {
-            NIC.try_with(|nic| {
-                let ret = nic.with_socket(self.handle,f);
-                nic.wake();
-                Ok(ret)
+        use std::sync::TryLockError::*;
+        NIC
+            .try_lock()
+            .or_else(|err| match err {
+                Poisoned(_) => Err(IOError!(Other,"internal mutex poisend")),
+                WouldBlock => Err(IOError!(WouldBlock,"nic mutex locked"))
             })
-        }
+            .and_then(|mut state| 
+                state.with(|nic| {
+                    let ret = nic.with_socket(self.handle,f);
+                    nic.wake();
+                    Ok(ret)
+                })
+            )
 	}
 
     /// Not in CLOSED, TIME-WAIT or LISTEN state
@@ -517,7 +509,7 @@ impl AsyncTcpSocket {
 	pub(crate) async fn close(self) -> io::Result<()> {
         // check whether the connection is already closed
 		let _check = future::poll_fn(|cx| {
-			self.with(|socket| match socket.state() {
+			self.try_with(|socket| match socket.state() {
 				smol::TcpState::Closed => Poll::Ready(
                     Err(IOError!(NotConnected,"socket already closed"))),
 				smol::TcpState::FinWait1
@@ -534,9 +526,9 @@ impl AsyncTcpSocket {
 						Poll::Ready(Ok(()))
 					}
 				}
-			})
-		})
-		.await;
+			}).unwrap_or(Poll::Pending)
+		}) 
+        .await?;
 
         // fully close the connection
         // ToDo: detach a separate future which fully closes the connection 
@@ -544,15 +536,26 @@ impl AsyncTcpSocket {
         //       TIMEWAIT
 		future::poll_fn(|cx| {
 			self.with(|socket| match socket.state() {
-				smol::TcpState::Closed | smol::TcpState::TimeWait => Poll::Ready(Ok(())),
+				smol::TcpState::Closed /*| smol::TcpState::TimeWait*/ => Poll::Ready(Ok(())),
 				_ => {
 					socket.register_send_waker(cx.waker());
 					Poll::Pending
 				}
 			})
 		})
-		.await
-        //.and(check)
+		.await?;
+
+		future::poll_fn(|_| { 
+            if let Ok(mut state) = NIC.try_lock() {
+                Poll::Ready(
+                    state
+                        .with(|nic| Ok(nic.socket_set.release(self.handle)))
+                )
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
 	}
 }
 
@@ -587,36 +590,37 @@ fn start_endpoint() -> u16 {
 }
 
 pub(crate) fn network_delay(timestamp: smol::Instant) -> Option<smol::Duration> {
-	unsafe { NIC.try_with(|nic| Ok(nic.poll_delay(timestamp))).ok().flatten() }
+	unsafe { NIC.lock().unwrap().with(|nic| Ok(nic.poll_delay(timestamp))).ok().flatten() }
 }
 
 // make this part of executor run
 pub(crate) async fn network_run() {
 	future::poll_fn(|cx| unsafe { 
         debug!("polling network future!");
-        NIC.try_with(|nic| {
-            debug!("running future");
-            nic.socket_set.prune();
-			nic.poll(cx, smol::Instant::now());
-			Ok(Poll::Pending)
-		})
-        .unwrap_or(Poll::Ready(()))
-	})
-	.await;
+        NIC
+            .try_lock()
+            .and_then(|mut state| 
+                state.with(|nic| 
+                    Ok({
+                        debug!("running future");
+                        nic.socket_set.prune();
+                        nic.poll(cx, smol::Instant::now());
+                        Ok(Poll::Pending)
+                    })
+                )
+                .unwrap()
+            )
+            .unwrap_or(Poll::Ready(()))
+	}) .await;
     error!("network_run exited");
 }
 
 extern "C" fn nic_thread(_: usize) {
 	loop {
-		unsafe {
-			sys_netwait();
-		}
+		unsafe { sys_netwait(); }
 
-		debug!("network interrupt");
-
-        unsafe { 
-            NIC.with(|nic| {
-                debug!("polling nic");
+        if let Ok(mut state) = NIC.try_lock() {
+            state.with(|nic| {
                 nic.poll_common(smol::Instant::now());
                 nic.wake();
                 Ok(())
@@ -629,30 +633,28 @@ pub(crate) fn network_init() -> io::Result<()> {
 	// initialize variable, which contains the next local endpoint
 	LOCAL_ENDPOINT.store(start_endpoint(), Ordering::Release);
 
-	unsafe {
-		NIC = NetworkInterface::<HermitNet>::new();
+    let mut guard = NIC.lock().unwrap();
+    *guard = NetworkInterface::<HermitNet>::new();
 
-        debug!("net init");
-        NIC.with(|nic|
-			    Ok(nic.poll_common(smol::Instant::now()))
-            )
-            .and_then(|_| {
-                debug!("spawning nic thread");
-				// create thread, which manages the network stack
-				// use a higher priority to reduce the network latency
-				let mut tid: Tid = 0;
-				let ret = sys_spawn(&mut tid, nic_thread, 0, 3, 0);
-				if ret >= 0 {
-					debug!("Spawn network thread with id {}", tid);
-				}
+    guard
+        .with(|nic|
+            Ok(nic.poll_common(smol::Instant::now()))
+        )
+        .and_then(|_| {
+            // create thread, which manages the network stack
+            // use a higher priority to reduce the network latency
+            let mut tid: Tid = 0;
+            let ret = unsafe { sys_spawn(&mut tid, nic_thread, 0, 3, 0) };
+            if ret >= 0 {
+                debug!("Spawn network thread with id {}", tid);
+            }
 
-				spawn(network_run()).detach();
+            spawn(network_run()).detach();
 
-				// switch to network thread
-				sys_yield();
-                Ok(())
-			})
-	}
+            // switch to network thread
+            unsafe { sys_yield() };
+            Ok(())
+        })
 }
 
 ///////////////////////////////////////////////////////////////////
@@ -676,9 +678,11 @@ pub fn sys_socket(mut info: abi::SocketInfo) -> io::Result<abi::Socket> {
     };
 
     match info.socket_type {
-        abi::SocketType::Tcp => unsafe { 
-            NIC.with( |nic| nic.create_tcp(info) )
-        },
+        abi::SocketType::Tcp => NIC
+            .lock()
+            .unwrap()
+            .with(|nic| nic.create_tcp(info) )
+        ,
         _ => Err(IOError!(InvalidInput, "Unsupported Socket Type")),
     }
 }
@@ -687,18 +691,19 @@ pub fn sys_socket(mut info: abi::SocketInfo) -> io::Result<abi::Socket> {
 #[no_mangle]
 pub fn sys_socket_dup(socket: abi::Socket) -> Result<abi::Socket,io::Error> {
     // ToDo: use internal reference count of SocketSet
-    unsafe { 
-        NIC.with( |nic| {
-            nic.retain(socket)
-        })?;
-    }
+    NIC.lock().unwrap().with( |nic| {
+        nic.retain(socket)
+    })?;
     Ok(socket)
 }
 
 /// close a socket
 #[no_mangle]
 pub fn sys_socket_close(socket: abi::Socket) -> io::Result<()> {
-    let MapEntry { handle, info, .. } = unsafe { NIC.with(|nic| nic.release(socket))? };
+    let MapEntry { handle, info, .. } = NIC
+        .lock()
+        .unwrap()
+        .with(|nic| nic.get(socket))?;
     let async_socket = AsyncTcpSocket::from(handle);
     let task = spawn(async_socket.close());
     if info.non_blocking {
@@ -716,14 +721,20 @@ pub fn sys_socket_close(socket: abi::Socket) -> io::Result<()> {
 ///       ToDo: make this work please
 #[no_mangle] 
 pub fn sys_tcp_listen(socket: abi::Socket) -> Result<(), io::Error> {
-    let MapEntry { handle, info, .. } = unsafe { NIC.with(|nic| nic.get(socket))? };
+    let MapEntry { handle, info, .. } = NIC
+        .lock()
+        .unwrap()
+        .with(|nic| nic.get(socket))?;
     let async_socket = AsyncTcpSocket::from(handle);
     async_socket.listen(abi_to_smol!(info.socket_addr => IpEndpoint))
 }
 
 #[no_mangle]
 pub fn sys_tcp_connect(socket: abi::Socket, remote: abi::SocketAddr) -> io::Result<()> {
-    let MapEntry { handle, info, .. } = unsafe { NIC.with(|nic| nic.get(socket))? };
+    let MapEntry { handle, info, .. } = NIC
+        .lock()
+        .unwrap()
+        .with(|nic| nic.get(socket))?;
     let local = abi_to_smol!(info.socket_addr => IpEndpoint);
     let remote = abi_to_smol!(remote => IpEndpoint);
     let async_socket = AsyncTcpSocket::from(handle);
@@ -750,7 +761,10 @@ pub fn sys_tcp_connect(socket: abi::Socket, remote: abi::SocketAddr) -> io::Resu
 
 #[no_mangle]
 pub fn sys_tcp_accept(socket: abi::Socket) -> Result<abi::Socket,io::Error> {
-    let MapEntry { handle, info, .. } = unsafe { NIC.with(|nic| nic.get(socket))? };
+    let MapEntry { handle, info, .. } = NIC
+        .lock()
+        .unwrap()
+        .with(|nic| nic.get(socket))?;
     let socket = AsyncTcpSocket::from(handle);
     unimplemented!()
     /*if info.non_blocking {
@@ -767,7 +781,10 @@ pub fn sys_tcp_accept(socket: abi::Socket) -> Result<abi::Socket,io::Error> {
 
 #[no_mangle] 
 pub fn sys_tcp_read(socket: abi::Socket, buf: &mut [u8]) -> Result<usize,io::Error> {
-    let MapEntry { handle, info, .. } = unsafe { NIC.with(|nic| nic.get(socket))? };
+    let MapEntry { handle, info, .. } = NIC
+        .lock()
+        .unwrap()
+        .with(|nic| nic.get(socket))?;
     let socket = AsyncTcpSocket::from(handle);
     
     if info.non_blocking {
@@ -785,7 +802,10 @@ pub fn sys_tcp_read(socket: abi::Socket, buf: &mut [u8]) -> Result<usize,io::Err
 
 #[no_mangle] 
 pub fn sys_tcp_write(socket: abi::Socket, buf: &[u8]) -> Result<usize, io::Error> {
-    let MapEntry { handle, info, .. } = unsafe { NIC.with(|nic| nic.get(socket))? };
+    let MapEntry { handle, info, .. } = NIC
+        .lock()
+        .unwrap()
+        .with(|nic| nic.get(socket))?;
     let socket = AsyncTcpSocket::from(handle);
 
     if info.non_blocking {
@@ -811,12 +831,16 @@ pub fn sys_tcp_stream_connect(
     port: u16, 
     timeout: Option<u64>
 ) -> Result<smol::SocketHandle, ()> {
-	let MapEntry { handle, info, .. } = unsafe { NIC.with( |nic| {
-        nic.create_tcp_with_port(Some(local_endpoint()))
-        .and_then(|abi_socket| {
-            nic.get(abi_socket)
+	let MapEntry { handle, info, .. } = NIC
+        .lock()
+        .unwrap()
+        .with(|nic| {
+            nic.create_tcp_with_port(Some(local_endpoint()))
+            .and_then(|abi_socket| {
+                nic.get(abi_socket)
+            })
         })
-    }).map_err(|_| ())?};
+    .map_err(|_| ())?;
     let ip_str = std::str::from_utf8(ip_slice).map_err(|_| ())?;
     let ip_address = smol::IpAddress::from_str(ip_str).map_err(|_| ())?;
     let async_socket = AsyncTcpSocket::from(handle);
@@ -961,13 +985,16 @@ pub fn sys_tcp_stream_get_tll(_handle: smol::SocketHandle) -> Result<u32, ()> {
 pub fn sys_tcp_stream_peer_addr(
     handle: smol::SocketHandle
 ) -> Result<(smol::IpAddress, u16), ()> {
-	let mut guard = match unsafe { &mut NIC } {
-		NetworkState::Initialized(nic) => nic.lock().unwrap(),
-		_ => return Err(()),
-	};
-	let mut socket = guard.socket_set.get::<smol::TcpSocket>(handle);
-	socket.set_keep_alive(Some(smol::Duration::from_millis(DEFAULT_KEEP_ALIVE_INTERVAL)));
-	let endpoint = socket.remote_endpoint();
+	let endpoint = NIC
+        .lock()
+        .unwrap()
+        .with(|nic| Ok({
+            let mut socket = nic.socket_set.get::<smol::TcpSocket>(handle);
+	        socket.set_keep_alive(
+                Some(smol::Duration::from_millis(DEFAULT_KEEP_ALIVE_INTERVAL)));
+            socket.remote_endpoint()
+        }))
+        .unwrap();
 
 	Ok((endpoint.addr, endpoint.port))
 }
@@ -976,12 +1003,15 @@ pub fn sys_tcp_stream_peer_addr(
 pub fn sys_tcp_listener_accept(
     port: u16
 ) -> Result<(smol::SocketHandle, smol::IpAddress, u16),()> {
-    let MapEntry { handle, info, .. } = unsafe { NIC.with( |nic|
-        nic.create_tcp_with_port(Some(port))
-        .and_then(|abi_socket| {
-            nic.get(abi_socket)
-        })
-    ).map_err(|_| ())? };
+    let MapEntry { handle, info, .. } = NIC
+        .lock()
+        .unwrap()
+        .with( |nic|
+            nic.create_tcp_with_port(Some(port))
+            .and_then(|abi_socket| {
+                nic.get(abi_socket)
+            })
+        ).map_err(|_| ())?;
 	let async_socket = AsyncTcpSocket::from(handle);
     async_socket.listen(abi_to_smol!(info.socket_addr => IpEndpoint)).map_err(|_| ())?;
     debug!("accepting ");

@@ -24,7 +24,8 @@ extern "C" {
 }
 
 extern "Rust" {
-	fn sys_block_current_task_with_timeout(timeout: Option<u64>);
+	fn sys_block_current_task_with_timeout(timeout: u64);
+	fn sys_block_current_task();
 }
 
 lazy_static! {
@@ -46,7 +47,7 @@ pub(crate) fn run_executor() {
 }
 
 /// Spawns a future on the executor.
-pub(crate) fn spawn<F, T>(future: F) -> Task<T>
+pub fn spawn<F, T>(future: F) -> Task<T>
 where
 	F: Future<Output = T> + Send + 'static,
 	T: Send + 'static,
@@ -98,15 +99,54 @@ impl Wake for ThreadNotify {
 	}
 }
 
+thread_local! {
+	static CURRENT_THREAD_NOTIFY: Arc<ThreadNotify> = Arc::new(ThreadNotify::new());
+}
+
+pub fn poll_on<F, T>(future: F, timeout: Option<Duration>) -> io::Result<T>
+where
+	F: Future<Output = T>,
+{
+	CURRENT_THREAD_NOTIFY.with(|thread_notify| {
+		unsafe {
+			sys_set_network_polling_mode(true);
+		}
+
+		let start = Instant::now();
+		let waker = thread_notify.clone().into();
+		let mut cx = Context::from_waker(&waker);
+		pin!(future);
+
+		loop {
+			if let Poll::Ready(t) = future.as_mut().poll(&mut cx) {
+				unsafe {
+					sys_set_network_polling_mode(false);
+				}
+				return Ok(t);
+			}
+
+			if let Some(duration) = timeout {
+				if Instant::now() >= start + duration {
+					unsafe {
+						sys_set_network_polling_mode(false);
+					}
+					return Err(io::Error { 
+                        kind: io::ErrorKind::TimedOut, 
+                        msg: "executor timed out" 
+                    });
+				}
+			}
+
+			run_executor()
+		}
+	})
+}
+
 /// Blocks the current thread on `f`, running the executor when idling.
 pub fn block_on<F, T>(future: F, timeout: Option<Duration>) -> io::Result<T>
 where
 	F: Future<Output = T>,
 {
-	thread_local! {
-		static CURRENT_THREAD_NOTIFY: Arc<ThreadNotify> = Arc::new(ThreadNotify::new());
-	}
-
 	CURRENT_THREAD_NOTIFY.with(|thread_notify| {
 		unsafe { sys_set_network_polling_mode(true) }
 		let start = Instant::now();
@@ -117,36 +157,37 @@ where
 		loop {
             debug!("polling blocking future");
 			if let Poll::Ready(t) = future.as_mut().poll(&mut cx) {
-				unsafe { sys_set_network_polling_mode(false) }
 				return Ok(t);
 			}
 
 			if let Some(duration) = timeout {
 				if Instant::now() >= start + duration {
-					unsafe { sys_set_network_polling_mode(false) }
-					return Err(io::Error { kind: io::ErrorKind::TimedOut, msg: "executor timed out" });
+					return Err(io::Error { 
+                        kind: io::ErrorKind::TimedOut, 
+                        msg: "executor timed out" 
+                    });
 				}
 			}
-
-            debug!("running executor");
-            run_executor();
 
             debug!("polling network");
             let delay = network_delay(start).map(|d| d.total_millis());
 
-            if delay.is_some() && delay.unwrap() > 100 {
-                let unparked = thread_notify.unparked.swap(false, Ordering::Acquire);
-                if !unparked {
-                    unsafe {
-                        sys_set_network_polling_mode(false);
-                        debug!("blocking for delay: {:?}", delay);
-                        sys_block_current_task_with_timeout(delay.map(|d| d-100));
-                        sys_yield();
-                        sys_set_network_polling_mode(true);
-                    }
-                    thread_notify.unparked.store(false, Ordering::Release);
-                } else { debug!("not running executor") }
-            }
+			if delay.is_none() || delay.unwrap() > 100 {
+				let unparked = thread_notify.unparked.swap(false, Ordering::Acquire);
+				if !unparked {
+					unsafe {
+						match delay {
+							Some(d) => sys_block_current_task_with_timeout(d),
+							None => sys_block_current_task(),
+						};
+						sys_yield();
+					}
+					thread_notify.unparked.store(false, Ordering::Release);
+					run_executor()
+				}
+			} else {
+				run_executor()
+			}
 		}
 	})
 }

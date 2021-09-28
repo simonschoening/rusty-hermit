@@ -1,6 +1,6 @@
 [package]
 name = "hermit-sys"
-version = "0.1.22"
+version = "0.1.24"
 authors = ["Stefan Lankes"]
 license = "MIT/Apache-2.0"
 description = "FFI bindings to HermitCore"
@@ -15,7 +15,7 @@ documentation = "https://hermitcore.github.io/rusty-hermit/hermit_sys"
 
 [features]
 default = ["pci", "acpi", "smp", "fsgsbase"]
-# controlls whether RustyHermit is build with -Z instrument-mcount
+# controls whether RustyHermit is build with -Z instrument-mcount
 instrument = ["rftrace"]
 trace = []
 fsgsbase = []
