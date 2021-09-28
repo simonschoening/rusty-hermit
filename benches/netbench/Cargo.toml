@@ -3,6 +3,7 @@
 name = "rust-tcp-io-perf"
 version = "0.0.0"
 authors = ["Lorenzo Martini <lmartini@student.ethz.ch>"]
+edition = "2018"
 readme = "README.md"
 
 description = "A Rust program to measure bandwidth or latency over a Rust TCP connection"
@@ -49,7 +50,7 @@ path = "src/rust-tcp-latency/client.rs"
 opt-level = 3
 debug = false
 rpath = false
-lto = true
+lto = false
 debug-assertions = false
 
 [profile.dev]
