@@ -75,7 +75,7 @@ fn main() {
         socket_close(sock).unwrap();
         println!("done");
         unsafe { 
-            abi::usleep(10_000);
+//            abi::usleep(10_000);
         }
     }
 }

@@ -21,9 +21,6 @@ extern "C" {
 	fn sys_yield();
 	fn sys_wakeup_task(tid: Tid);
 	fn sys_set_network_polling_mode(value: bool);
-}
-
-extern "Rust" {
 	fn sys_block_current_task_with_timeout(timeout: u64);
 	fn sys_block_current_task();
 }
@@ -38,22 +35,28 @@ pub(crate) fn run_executor() {
     //          -> mark futures safe to be detached, if they 
     //             register a waker before Pending 
     let mut wake_buf = Vec::with_capacity(QUEUE.len());
+	unsafe { sys_set_network_polling_mode(true) };
 	while let Ok(runnable) = QUEUE.pop() {
         wake_buf.push(runnable.waker());
-        debug!("running future");
+        let waker = runnable.waker();
 		runnable.run();
 	}
+	unsafe { sys_set_network_polling_mode(false) };
     for waker in wake_buf { waker.wake() };
+
 }
 
 /// Spawns a future on the executor.
+///
+/// if a future has not registered a waker
+/// and it's task is never polled, it will leak memory
+#[must_use]
 pub fn spawn<F, T>(future: F) -> Task<T>
 where
 	F: Future<Output = T> + Send + 'static,
 	T: Send + 'static,
 {
 	let schedule = |runnable| { 
-        debug!("rescheduling future");
         QUEUE.push(runnable).unwrap() 
     };
 	let (runnable, task) = async_task::spawn(future, schedule);

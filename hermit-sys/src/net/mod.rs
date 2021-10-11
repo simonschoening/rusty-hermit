@@ -99,13 +99,13 @@ pub(crate) enum NetworkState {
 }
 
 impl NetworkState {
-    pub fn with<F,R>(&mut self, f: F) -> io::Result<R> 
+    pub fn with<F,R>(&mut self, f: F) -> R 
     where
-        F: FnOnce(&mut NetworkInterface<HermitNet>) -> io::Result<R>,
+        F: FnOnce(&mut NetworkInterface<HermitNet>) -> R,
     {
 		match self {
 			NetworkState::Initialized(nic) => f(nic),
-			_ => Err(IOError!(NotFound,"Network Interface not found")),
+			_ => panic!("Network Interface not found"),
 		}
     }
 }
@@ -256,7 +256,6 @@ where
 			.poll(&mut self.socket_set, timestamp.into())
 			.unwrap_or(true)
 		{
-            debug!("poll_common() loop");
 			// just to make progress
 		}
 		#[cfg(feature = "dhcpv4")]
@@ -330,29 +329,29 @@ impl AsyncTcpSocket {
             .with(|nic| {
                 let ret = nic.with_socket(self.handle,f);
                 nic.wake();
-                Ok(ret)
+                ret
             })
-            .unwrap()
-	}
+    }
 
-	fn try_with<F,R>(&self, f: F) -> io::Result<R> 
+	fn poll<F,R>(&self, f: F) -> Poll<R> 
     where
-        F: FnOnce(&mut smol::TcpSocket) -> R
+        F: FnOnce(&mut smol::TcpSocket) -> Poll<R>
     {
         use std::sync::TryLockError::*;
-        NIC
-            .try_lock()
-            .or_else(|err| match err {
-                Poisoned(_) => Err(IOError!(Other,"internal mutex poisend")),
-                WouldBlock => Err(IOError!(WouldBlock,"nic mutex locked"))
-            })
-            .and_then(|mut state| 
-                state.with(|nic| {
-                    let ret = nic.with_socket(self.handle,f);
-                    nic.wake();
-                    Ok(ret)
-                })
-            )
+
+        let mut f = Some(|nic: &mut NetworkInterface<_>| {
+            let ret = nic.with_socket(self.handle,f);
+            nic.wake();
+            ret
+        });
+
+        match NIC.try_lock() {
+            Err(err) => match err {
+                Poisoned(_) => panic!("internal mutex poisend"),
+                WouldBlock => Poll::Pending,
+            },
+            Ok(mut state) => state.with(f.take().unwrap()),
+        }
 	}
 
     /// Not in CLOSED, TIME-WAIT or LISTEN state
@@ -435,16 +434,16 @@ impl AsyncTcpSocket {
 		self.with(|socket| 
             if socket.can_send() {
 				socket.send_slice(buffer).map_err(|_| 
-                    IOError!(Other, "receive failed"))
+                    IOError!(Other, "send failed"))
 			} else {
-                Err(IOError!(Other, "can't receive"))
+                Err(IOError!(Other, "can't send"))
             }
 		)
 	}
 
 	pub(crate) async fn wait_for_readable(self) -> io::Result<Self> {
 		future::poll_fn(|cx| {
-			self.try_with(|socket| 
+			self.poll(|socket| 
                 if !socket.may_recv() {
 				    Poll::Ready(Err(IOError!(ConnectionAborted,"socket closed")))
                 } else if socket.can_recv() {
@@ -453,14 +452,14 @@ impl AsyncTcpSocket {
                     socket.register_recv_waker(cx.waker());
                     Poll::Pending
                 }
-			).unwrap_or(Poll::Pending)
+            )
 		}).await?;
         Ok(self)
 	}
 
 	pub(crate) async fn wait_for_writeable(self) -> io::Result<Self> {
 		future::poll_fn(|cx| {
-			self.try_with(|socket| 
+			self.poll(|socket| 
                 if !socket.may_send() {
 				    Poll::Ready(Err(IOError!(ConnectionAborted,"socket closed")))
                 } else if socket.can_send() {
@@ -469,14 +468,14 @@ impl AsyncTcpSocket {
                     socket.register_send_waker(cx.waker());
                     Poll::Pending
                 }
-			).unwrap_or(Poll::Pending)
+			)
 		}).await?;
         Ok(self)
 	}
 
     pub(crate) async fn wait_for_incoming_connection(self) -> io::Result<Self> {
 		future::poll_fn(|cx| {
-			self.try_with(|socket|
+			self.poll(|socket|
                 if !socket.is_open() {
                     Poll::Ready(Err(IOError!(ConnectionRefused,"socket closed")))
                 } else if socket.is_active() {
@@ -485,15 +484,14 @@ impl AsyncTcpSocket {
                     socket.register_recv_waker(cx.waker());
                     Poll::Pending
 				}
-			).unwrap_or(Poll::Pending)
+			)
 		}).await?;
         Ok(self)
     }
 
 	pub(crate) async fn wait_for_connection(self) -> io::Result<()> {
 		future::poll_fn(|cx| {
-			self.with(|socket| { 
-                debug!("socket in state {:?}", socket.state());
+			self.poll(|socket| { 
                 if !socket.is_open() {
                     Poll::Ready(Err(IOError!(ConnectionRefused, "socket closed")))
                 } else if let smol::TcpState::Established = socket.state() {
@@ -509,7 +507,7 @@ impl AsyncTcpSocket {
 	pub(crate) async fn close(self) -> io::Result<()> {
         // check whether the connection is already closed
 		let _check = future::poll_fn(|cx| {
-			self.try_with(|socket| match socket.state() {
+			self.poll(|socket| match socket.state() {
 				smol::TcpState::Closed => Poll::Ready(
                     Err(IOError!(NotConnected,"socket already closed"))),
 				smol::TcpState::FinWait1
@@ -526,7 +524,7 @@ impl AsyncTcpSocket {
 						Poll::Ready(Ok(()))
 					}
 				}
-			}).unwrap_or(Poll::Pending)
+			})
 		}) 
         .await?;
 
@@ -535,8 +533,9 @@ impl AsyncTcpSocket {
         //       and emits an event, currently this waits an eternity in
         //       TIMEWAIT
 		future::poll_fn(|cx| {
-			self.with(|socket| match socket.state() {
-				smol::TcpState::Closed /*| smol::TcpState::TimeWait*/ => Poll::Ready(Ok(())),
+			self.poll(|socket| match socket.state() {
+				smol::TcpState::Closed /*| smol::TcpState::TimeWait */ => 
+                    Poll::Ready(Ok(())),
 				_ => {
 					socket.register_send_waker(cx.waker());
 					Poll::Pending
@@ -545,17 +544,13 @@ impl AsyncTcpSocket {
 		})
 		.await?;
 
-		future::poll_fn(|_| { 
-            if let Ok(mut state) = NIC.try_lock() {
-                Poll::Ready(
-                    state
-                        .with(|nic| Ok(nic.socket_set.release(self.handle)))
-                )
-            } else {
-                Poll::Pending
-            }
-        })
-        .await
+        NIC
+            .lock()
+            .unwrap()
+            .with(|nic|
+                nic.socket_set.release(self.handle));
+
+        Ok(())
 	}
 }
 
@@ -590,29 +585,29 @@ fn start_endpoint() -> u16 {
 }
 
 pub(crate) fn network_delay(timestamp: smol::Instant) -> Option<smol::Duration> {
-	unsafe { NIC.lock().unwrap().with(|nic| Ok(nic.poll_delay(timestamp))).ok().flatten() }
+    NIC
+        .lock()
+        .unwrap()
+        .with(|nic| 
+            nic.poll_delay(timestamp))
 }
 
 // make this part of executor run
 pub(crate) async fn network_run() {
-	future::poll_fn(|cx| unsafe { 
-        debug!("polling network future!");
-        NIC
-            .try_lock()
-            .and_then(|mut state| 
-                state.with(|nic| 
-                    Ok({
-                        debug!("running future");
-                        nic.socket_set.prune();
-                        nic.poll(cx, smol::Instant::now());
-                        Ok(Poll::Pending)
-                    })
-                )
-                .unwrap()
-            )
-            .unwrap_or(Poll::Ready(()))
-	}) .await;
-    error!("network_run exited");
+	loop {
+        let _:() = future::poll_fn(|cx| { 
+            if let Ok(mut state) = NIC.try_lock() {
+                state.with(|nic| {
+                    nic.socket_set.prune();
+                    nic.poll(cx, smol::Instant::now());
+                })
+            } else {
+                error!("network_run couldn't lock");
+            }
+            Poll::Pending
+        })
+        .await;
+    }
 }
 
 extern "C" fn nic_thread(_: usize) {
@@ -623,8 +618,7 @@ extern "C" fn nic_thread(_: usize) {
             state.with(|nic| {
                 nic.poll_common(smol::Instant::now());
                 nic.wake();
-                Ok(())
-            }).unwrap();
+            });
         }
 	}
 }
@@ -740,13 +734,12 @@ pub fn sys_tcp_connect(socket: abi::Socket, remote: abi::SocketAddr) -> io::Resu
     let async_socket = AsyncTcpSocket::from(handle);
 
     if info.non_blocking {
-        run_executor();
         if !async_socket.is_open() {
             debug!("connecting {local} to {remote}", local=local, remote=remote);
             async_socket.connect(remote,local)?;
             Err(IOError!(WouldBlock,"connect would block"))
         } else if !async_socket.is_connected() {
-            debug!("not yet connected");
+            run_executor();
             Err(IOError!(WouldBlock,"connect would block"))
         } else {
             Ok(())
@@ -845,17 +838,18 @@ pub fn sys_tcp_stream_connect(
     let ip_address = smol::IpAddress::from_str(ip_str).map_err(|_| ())?;
     let async_socket = AsyncTcpSocket::from(handle);
 
-    async_socket.connect(
-        (ip_address, port).into(), 
-        abi_to_smol!(info.socket_addr => IpEndpoint)
-    ).map_err(|_| ())?;
-	block_on(
-		async_socket.wait_for_connection(),
-		timeout.map(|ms| smol::Duration::from_millis(ms)),
-	)
-    .map_err(|_| { debug!("timeout"); () })?
-    .map(|_| handle)
-    .map_err(|err| { debug!("connect failed {:?}",err); () })
+    async_socket
+        .connect(
+            (ip_address, port).into(), 
+            abi_to_smol!(info.socket_addr => IpEndpoint)
+        ).map_err(|_| ())?;
+        block_on(
+            async_socket.wait_for_connection(),
+            timeout.map(|ms| smol::Duration::from_millis(ms)),
+        )
+        .map_err(|_| { debug!("timeout"); () })?
+        .map(|_| handle)
+        .map_err(|err| { debug!("connect failed {:?}",err); () })
 }
 
 #[no_mangle]
@@ -988,13 +982,12 @@ pub fn sys_tcp_stream_peer_addr(
 	let endpoint = NIC
         .lock()
         .unwrap()
-        .with(|nic| Ok({
+        .with(|nic| {
             let mut socket = nic.socket_set.get::<smol::TcpSocket>(handle);
 	        socket.set_keep_alive(
                 Some(smol::Duration::from_millis(DEFAULT_KEEP_ALIVE_INTERVAL)));
             socket.remote_endpoint()
-        }))
-        .unwrap();
+        });
 
 	Ok((endpoint.addr, endpoint.port))
 }
