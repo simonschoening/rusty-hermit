@@ -1,6 +1,7 @@
 pub mod device;
 mod executor;
 mod waker;
+mod map_entry;
 
 #[cfg(target_arch = "aarch64")]
 use aarch64::regs::*;
@@ -186,6 +187,11 @@ where
     pub(crate) fn get(&self, socket: abi::Socket) -> io::Result<MapEntry> {
         self.socket_map.get(&socket)
             .map(|entry| entry.clone())
+            .ok_or(IOError!(InvalidInput, "Unknown Socket"))
+    }
+
+    pub(crate) fn get_ref(&self, socket: abi::Socket) -> io::Result<&MapEntry> {
+        self.socket_map.get(&socket)
             .ok_or(IOError!(InvalidInput, "Unknown Socket"))
     }
 
