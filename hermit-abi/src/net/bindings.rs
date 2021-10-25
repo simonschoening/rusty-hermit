@@ -1,22 +1,22 @@
-use crate::net::{Socket, SocketAddr, SocketInfo};
+use crate::net::{Socket, SocketAddr, SocketType};
 use crate::io::Result;
 //use crate::event::{Interest, Event};
 
 extern "Rust" {
 // Socket
-    fn sys_socket(info: SocketInfo) 
+    fn sys_socket(ty: SocketType)
         -> Result<Socket>;
     fn sys_socket_dup(socket: Socket) 
         -> Result<Socket>;
-    fn sys_socket_update(socket: Socket, info: Option<SocketInfo>) 
-        -> Result<SocketInfo>;
+    fn sys_socket_set_non_blocking(socket: Socket, non_blocking: bool) 
+        -> Result<()>;
     fn sys_socket_close(socket: Socket) 
         -> Result<()>;
 //    fn sys_socket_wait(socket: Socket, interest: Interest, timeout: time::Duration) 
 //        -> Result<Event, io::Error>;
 
 // TCP
-    fn sys_tcp_listen(socket: Socket) 
+    fn sys_tcp_listen(socket: Socket, backlog: usize) 
         -> Result<()>;
     fn sys_tcp_accept(socket: Socket) 
         -> Result<Socket>;
@@ -30,24 +30,24 @@ extern "Rust" {
         -> Result<usize>;
 }
 
-pub fn socket(info: SocketInfo) -> Result<Socket> {
-    unsafe { sys_socket(info) }
+pub fn socket(ty: SocketType) -> Result<Socket> {
+    unsafe { sys_socket(ty) }
 }
 
 pub fn socket_dup(socket: Socket) -> Result<Socket> {
     unsafe { sys_socket_dup(socket) }
 }
 
-pub fn socket_update(socket: Socket, info: Option<SocketInfo>) -> Result<SocketInfo> {
-    unsafe { sys_socket_update(socket, info) }
+pub fn socket_set_non_blocking(socket: Socket, non_blocking: bool) -> Result<()> {
+    unsafe { sys_socket_set_non_blocking(socket, non_blocking) }
 }
 
 pub fn socket_close(socket: Socket) -> Result<()> {
     unsafe { sys_socket_close(socket) }
 }
 
-pub fn tcp_listen(socket: Socket) -> Result<()> {
-    unsafe { sys_tcp_listen(socket) }
+pub fn tcp_listen(socket: Socket, backlog: usize) -> Result<()> {
+    unsafe { sys_tcp_listen(socket,backlog) }
 }
 
 pub fn tcp_accept(socket: Socket) -> Result<Socket> {

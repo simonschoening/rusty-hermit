@@ -7,12 +7,10 @@ extern crate hermit_sys;
 fn main() { 
     for num in 1.. {
         print!("creating socket...");
-        let sock = socket( SocketInfo {
-            socket_addr: SocketAddr::V4(SocketAddrV4::UNSPECIFIED),
-            socket_type: SocketType::Tcp,
-            non_blocking: true,
-        }).unwrap();
+        let sock = socket(SocketType::Tcp).unwrap();
         println!("done");
+
+        socket_set_non_blocking(sock,true);
 
         print!("connecting socket..");
         let addr = SocketAddr::V4(SocketAddrV4 { 
@@ -27,7 +25,7 @@ fn main() {
         while let Err(err) = tcp_connect(sock, addr) {
             if err.kind == abi::io::ErrorKind::WouldBlock {
                 print!(".");
-                //unsafe { abi::usleep(100_000) }
+                unsafe { abi::usleep(10_000) }
                 continue;
             } else {
                 panic!("{:?}",err);
@@ -35,15 +33,21 @@ fn main() {
         }
         println!("done");
 
-        print!("sending data...");
+        print!("sending data..");
         let data = format!("Verbindung {}", num);
         // data that still needs to be sent
         let mut to_send: &[u8] = data.as_bytes();
         loop {
             match tcp_write(sock, to_send) {
-                Err(err) if err.kind == abi::io::ErrorKind::WouldBlock 
-                    => continue,
-                Err(err) => panic!("{:?}",err),
+                Err(err) => {
+                    if err.kind == abi::io::ErrorKind::WouldBlock {
+                        print!(".");
+                        unsafe { abi::usleep(10_000) }
+                        continue;
+                    } else {
+                        panic!("{:?}",err)
+                    }
+                }
                 Ok(0) => panic!("socket closed"),
                 // if something was written change to_send slice
                 Ok(n) => to_send = &to_send[n..],
@@ -56,9 +60,15 @@ fn main() {
         let mut buf = [0u8; 256];
         let read = loop {
             match tcp_read(sock, &mut buf) {
-                Err(err) if err.kind == abi::io::ErrorKind::WouldBlock 
-                    => continue,
-                Err(err) => panic!("{:?}",err),
+                Err(err) => {
+                    if err.kind == abi::io::ErrorKind::WouldBlock {
+                        print!(".");
+                        unsafe { abi::usleep(10_000) }
+                        continue;
+                    } else {
+                        panic!("{:?}",err)
+                    }
+                }
                 Ok(0) => panic!("socket closed"),
                 // return when something was received
                 Ok(n) => break n,
