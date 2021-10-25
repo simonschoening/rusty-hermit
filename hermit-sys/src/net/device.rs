@@ -7,7 +7,6 @@ use std::convert::TryInto;
 #[cfg(not(feature = "dhcpv4"))]
 use std::net::Ipv4Addr;
 use std::slice;
-use std::sync::Mutex;
 
 #[cfg(feature = "dhcpv4")]
 use smoltcp::dhcp::Dhcpv4Client;
@@ -26,7 +25,7 @@ use smoltcp::wire::Ipv4Cidr;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address};
 
 use crate::net::waker::WakerRegistration;
-use crate::net::{NetworkInterface, NetworkState};
+use crate::net::nic::{NetworkInterface, NetworkState};
 
 extern "Rust" {
 	fn sys_get_mac_address() -> Result<[u8; 6], ()>;
@@ -98,7 +97,6 @@ impl NetworkInterface<HermitNet> {
 			iface,
 			socket_set,
 			dhcp,
-            socket_map: std::collections::HashMap::new(),
 			prev_cidr,
 			waker: WakerRegistration::new(),
 		}))
@@ -172,7 +170,6 @@ impl NetworkInterface<HermitNet> {
 		NetworkState::Initialized(Self {
 			iface,
 			socket_set: SocketSet::new(vec![]),
-            socket_map: std::collections::HashMap::new(),
 			waker: WakerRegistration::new(),
 		})
 	}
