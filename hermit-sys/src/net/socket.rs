@@ -71,10 +71,7 @@ impl AsyncSocket {
 	pub(crate) fn close(&mut self) {
 		match self {
 			Self::Unbound => (),
-			Self::Tcp(tcp) => {
-				tcp.rclose();
-				tcp.wclose();
-			}
+			Self::Tcp(tcp) => tcp.close(),
 			Self::TcpBacklog(tcp_backlog) => tcp_backlog.close(),
 			Self::Event(_) => (),
 			Self::Waker(waker) => waker.close(),

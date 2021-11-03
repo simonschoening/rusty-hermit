@@ -88,6 +88,7 @@ where
 		let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; 65535]);
 		let tcp_tx_buffer = TcpSocketBuffer::new(vec![0; 65535]);
 		let tcp_socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
+        trace!("creating tcp handle");
 		self.socket_set.add(tcp_socket)
 	}
 

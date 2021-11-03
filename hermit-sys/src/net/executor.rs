@@ -213,7 +213,7 @@ where
 					// wait for the advised delay if it's greater than 100ms
 					if !thread_notify.was_woken() && (delay.is_none() || delay.unwrap() > 100) {
 						unsafe {
-							sys_block_current_task_with_timeout(delay.unwrap_or(500));
+							sys_block_current_task_with_timeout(delay.unwrap_or(10000));
 							if thread_notify.swap_unparked() {
 								debug!("not blocking! thread_notify was already unparked");
 								sys_wakeup_task(thread_notify.thread);

@@ -354,12 +354,18 @@ impl AsyncTcpSocket {
 					"the socket is still closing",
 				)),
 				// this socket can by connected
-				State::Closed if self.error.is_none() => self
-					.with_socket_mut(|socket| socket.connect(remote, local))
-					.map_err(|_| {
-						io::Error::new(io::ErrorKind::Other, "can't connect. internal tcp error")
-					})
-					.map(|()| self.state.store(State::Connecting)),
+				State::Closed if self.error.is_none() => {
+                    self
+                        .with_socket_mut(|socket| socket.connect(remote, local))
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::Other, "can't connect. internal tcp error")
+                        })
+                        .map(|()| self.state.store(State::Connecting))?;
+					Err(io::Error::new(
+					    io::ErrorKind::WouldBlock,
+					    "the socket is connecting",
+			    	))
+                }
 				// closed by error
 				State::Closed => Err(self.error.take().unwrap()),
 				// already connecting
@@ -473,8 +479,14 @@ impl AsyncTcpSocket {
 	}
 
 	pub(crate) fn close(&mut self) {
-		self.with_socket_mut(|socket| socket.abort());
 		self.state.store(State::Closed);
+		let mut async_socket = self.clone();
+		executor::spawn(async move {
+			async_socket.wait_for_remaining_packets().await;
+			trace!("graceful shutdown completed, closing socket");
+			async_socket.with_socket_mut(|socket| socket.abort());
+		})
+		.detach();
 	}
 
 	pub(crate) fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
@@ -589,14 +601,10 @@ impl AsyncTcpSocket {
 	}
 
 	pub(crate) async fn wait_for_closed(&self) {
-		self.poll_with_socket(|socket, wake| match socket.state() {
-			TcpState::Closed => Poll::Ready(()),
-			state @ _ => {
-				trace!(
-					"waiting to close AsyncTcpSocket with {:?} in state {:?}",
-					self.handle,
-					state
-				);
+		self.poll_with_socket(|socket, wake| {
+            if !socket.is_open() {
+                Poll::Ready(())
+            } else {
 				let _ = wake.insert(WakeOn::Any);
 				Poll::Pending
 			}

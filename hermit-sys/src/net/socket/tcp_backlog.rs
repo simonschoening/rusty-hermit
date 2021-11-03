@@ -66,58 +66,63 @@ impl AsyncTcpBacklog {
 		}
 	}
 
-	pub(crate) fn accept(&mut self) -> io::Result<Socket> {
+	pub(crate) fn accept(&self) -> io::Result<Socket> {
 		let Self { socket, local, .. } = *self;
 		self.backlog
-			.iter_mut()
-			.find_map(|async_socket| {
-				if let Ok(_) = async_socket.accept() {
-					let handle = nic::lock().with(|nic| nic.create_tcp_handle());
-					let async_socket = std::mem::replace(
-						async_socket,
-						AsyncTcpSocket::new(Some(socket), handle, local),
-					);
-					let mut socket_map = socket_map::lock();
-					Some(
-						socket_map
-							.get_mut(socket)
-							.map(|entry| {
-								entry.wake_tasks();
-								entry.options
-							})
-							.and_then(|options| {
-								let socket = socket_map.new_socket(options);
-								socket_map.bind_socket(socket, async_socket.into())?;
-								Ok(socket)
-							}),
-					)
-				} else {
-					None
-				}
+			.iter()
+            .enumerate()
+			.find_map(|(index,async_socket)| 
+                  async_socket.is_connected().then(|| index))
+            .map(|index| {
+                let handle = nic::lock().with(|nic| nic.create_tcp_handle());
+                let mut new_socket = AsyncTcpSocket::new(Some(socket), handle, local);
+                new_socket.listen()?;
+                let mut socket_map = socket_map::lock();
+                let backlog_entry = socket_map.get_mut(socket)?
+                    .async_socket.get_tcp_backlog()?;
+                let connected_socket = std::mem::replace(
+                    &mut backlog_entry.backlog[index],
+                    new_socket);
+         
+                socket_map
+                    .get_mut(socket)
+                    .map(|entry| {
+                        entry.wake_tasks();
+                        entry.options
+                    })
+                    .and_then(|options| {
+                        let socket = socket_map.new_socket(options);
+                        socket_map.bind_socket(socket, connected_socket.into())?;
+                        Ok(socket)
+                    })
 			})
-			.ok_or(io::Error::new(
-				io::ErrorKind::WouldBlock,
-				"no socket in backlog is ready",
-			))?
+			.ok_or_else(|| {
+                debug!("no connection available");
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "no socket in backlog is ready",
+		    	)
+            })?
 	}
 
 	pub(crate) fn close(&mut self) {
 		for socket in self.backlog.iter_mut() {
-			socket.close();
+			socket.rclose();
+			socket.wclose();
 		}
 	}
 
 	pub(crate) async fn wait_for_incoming_connection(&self) {
 		future::poll_fn(|cx| {
+            trace!("polling wait for incoming connection");
 			if self.backlog.iter().any(AsyncTcpSocket::is_connected) {
 				Poll::Ready(())
-			} else {
-				socket_map::lock()
-					.get_mut(self.socket)
-					.unwrap()
-					.register_send_waker(cx.waker());
+			} else if let Ok(entry) = socket_map::lock().get_mut(self.socket) {
+			    entry.register_recv_waker(cx.waker());
 				Poll::Pending
-			}
+			} else {
+                Poll::Ready(())
+            }
 		})
 		.await
 	}

@@ -39,11 +39,9 @@ mod smol {
 use hermit_abi::io;
 use hermit_abi::net as abi;
 use hermit_abi::Tid;
-
 use futures_lite::future;
-
 use crate::net::device::HermitNet;
-use crate::net::executor::{block_on, poll_on, run_executor, spawn};
+use crate::net::executor::{block_on, run_executor, spawn};
 use crate::net::socket::AsyncTcpSocket;
 
 macro_rules! abi_to_smol {
@@ -83,16 +81,6 @@ macro_rules! abi_to_smol {
             smol::IpAddress::v6(ip.a, ip.b, ip.c, ip.d, ip.e, ip.f, ip.g, ip.h)
         }
     }
-}
-
-// reduce boilerplate and convieniently use hermit_abi::io:Error everywhere
-macro_rules! IOError {
-	($kind:ident, $msg:literal) => {
-		io::Error {
-			kind: hermit_abi::io::ErrorKind::$kind,
-			msg: $msg,
-		}
-	};
 }
 
 extern "C" {
@@ -147,12 +135,11 @@ extern "C" fn nic_thread(_: usize) {
 			sys_netwait();
 		}
 
-		// wake the network:run future on the executor
+		// wake the network_run future on the executor
 		trace!("waking nic");
 		nic::lock().with(|nic| nic.wake());
-		// this wakes all thread that have blocking io ready
+		// this wakes all threads that have blocking io ready
 		run_executor();
-		trace!("nic_thread ready");
 	}
 }
 
@@ -301,7 +288,7 @@ pub fn sys_tcp_bind(socket: abi::Socket, local: abi::SocketAddr) -> io::Result<(
 	debug!("binding tcp socket");
 	let local = abi_to_smol!(local => IpEndpoint);
 	let handle = nic::lock().with(|nic| {
-		if nic.iface.has_ip_addr(local.addr) {
+		if local.addr.is_unspecified() || nic.iface.has_ip_addr(local.addr) {
 			Ok(nic.create_tcp_handle())
 		} else {
 			Err(io::Error::new(
@@ -321,36 +308,27 @@ pub fn sys_tcp_bind(socket: abi::Socket, local: abi::SocketAddr) -> io::Result<(
 ///       any futher connection attempts after the first will be reset
 ///       ToDo: make this work please
 #[no_mangle]
-pub fn sys_tcp_listen(socket: abi::Socket, backlog: usize) -> Result<(), io::Error> {
-	unimplemented!();
-	/*
-	let entry = socket_map::lock().get_mut(socket).unwrap();
-	if entry.async_socket.as_tcp_ref()?.is_closed() {
-		entry.async_socket.into_tcp_backlog(16)?;
-	} else {
-		// TODO: Error ...
-	}
-	let backlog = entry.async_socket.as_tcp_backlog()?;
-	for async_socket in backlog.iter() {
-		async_socket.listen();
-	}
-	*/
+pub fn sys_tcp_listen(socket: abi::Socket, backlog: usize) -> io::Result<()> {
+    debug!("binding tcp backlog");
+	let async_socket = socket_map::lock().get_mut(socket)?.async_socket.get_tcp()?.clone();
+	socket_map::lock().bind_socket(socket, 
+        socket::AsyncTcpBacklog::listen_on(async_socket,backlog)?.into())?;
+	run_executor();
+    Ok(())
 }
 
 #[no_mangle]
-pub fn sys_tcp_accept(socket: abi::Socket) -> Result<abi::Socket, io::Error> {
+pub fn sys_tcp_accept(socket: abi::Socket) -> io::Result<abi::Socket> {
 	run_executor();
-	unimplemented!()
-	/*if info.non_blocking {
-		if socket.can_recv() {
-			socket.accept()?;
-		} else {
-			Err(IOError!(WouldBlock,"socket recv buffer empty"))
-		}
-	} else {
-		let socket = block_on(socket.wait_for_incoming_connection(), None)??;
-		socket.read(buf)
-	}*/
+	let (mut async_socket, options) = socket_map::lock().get(socket)?.split_cloned();
+	let async_socket = async_socket.get_tcp_backlog()?;
+	if !options.non_blocking {
+		block_on(async_socket.wait_for_incoming_connection(), options.timeout)?;
+        trace!("accepting connection");
+	}
+    let socket = async_socket.accept()?;
+    run_executor();
+    Ok(socket)
 }
 
 #[no_mangle]
@@ -358,7 +336,6 @@ pub fn sys_tcp_connect(socket: abi::Socket, remote: abi::SocketAddr) -> io::Resu
 	run_executor();
 	let (mut async_socket, options) = socket_map::lock().get(socket)?.split_cloned();
 	let async_socket = async_socket.get_tcp()?;
-	let local = local_endpoint();
 	let remote = abi_to_smol!(remote => IpEndpoint);
 
 	if options.non_blocking {
@@ -366,11 +343,9 @@ pub fn sys_tcp_connect(socket: abi::Socket, remote: abi::SocketAddr) -> io::Resu
 			let mut async_socket = async_socket.clone();
 			debug!(
 				"connecting {local} to {remote}",
-				local = local,
+				local = async_socket.local,
 				remote = remote
 			);
-			async_socket.connect(remote)?;
-			run_executor();
 			async_socket.connect(remote)
 		} else {
 			async_socket.connect(remote)
@@ -378,10 +353,11 @@ pub fn sys_tcp_connect(socket: abi::Socket, remote: abi::SocketAddr) -> io::Resu
 	} else {
 		debug!(
 			"connecting {local} to {remote}",
-			local = local,
+			local = async_socket.local,
 			remote = remote
 		);
-		async_socket.connect(remote)?;
+        // ignore first result since it would probably be WouldBlock
+		let _ = async_socket.connect(remote);
 		debug!("wait for connection");
 		block_on(async_socket.wait_for_connection(), None)?;
 		async_socket.connect(remote)
@@ -423,16 +399,12 @@ pub fn sys_tcp_read(socket: abi::Socket, buf: &mut [u8]) -> io::Result<usize> {
 	let (mut async_socket, options) = socket_map::lock().get(socket)?.split_cloned();
 	let async_socket = async_socket.get_tcp()?;
 
-	if options.non_blocking {
-		if async_socket.can_recv() {
-			async_socket.read(buf)
-		} else {
-			Err(IOError!(WouldBlock, "socket recv buffer empty"))
-		}
-	} else {
-		block_on(async_socket.wait_for_readable(), None)?;
-		async_socket.read(buf)
+	if !options.non_blocking {
+		block_on(async_socket.wait_for_readable(), options.timeout)?;
 	}
+	let n = async_socket.read(buf)?;
+    run_executor();
+    Ok(n)
 }
 
 #[no_mangle]
@@ -441,16 +413,13 @@ pub fn sys_tcp_write(socket: abi::Socket, buf: &[u8]) -> Result<usize, io::Error
 	let (mut async_socket, options) = socket_map::lock().get(socket)?.split_cloned();
 	let async_socket = async_socket.get_tcp()?;
 
-	if options.non_blocking {
-		if async_socket.can_send() {
-			async_socket.write(buf)
-		} else {
-			Err(IOError!(WouldBlock, "socket send buffer full"))
-		}
-	} else {
-		block_on(async_socket.wait_for_writeable(), None)?;
-		async_socket.write(buf)
+	if !options.non_blocking {
+		block_on(async_socket.wait_for_writeable(), options.timeout)?;
 	}
+
+	let n = async_socket.write(buf)?;
+    run_executor();
+    Ok(n)
 }
 
 ///////////////////////////////////////////////////////////////////
