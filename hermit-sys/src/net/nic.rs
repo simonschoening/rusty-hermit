@@ -20,7 +20,7 @@ pub(crate)fn lock() -> MutexGuard<'static,NetworkState> {
 }
 
 pub(crate)fn register_waker(waker: &Waker) {
-    WAKER.push(waker.clone());
+    WAKER.push(waker.clone()).unwrap();
 }
 
 fn wake_any() {

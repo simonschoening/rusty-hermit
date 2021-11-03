@@ -83,11 +83,11 @@ impl ThreadNotify {
 	}
 
     pub fn was_woken(&self) -> bool {
-		self.woken.swap(false, Ordering::Relaxed)
+		self.woken.load(Ordering::Relaxed)
     }
 
-    pub fn was_unparked(&self) -> bool {
-		self.unparked.swap(false, Ordering::Relaxed)
+    pub fn swap_unparked(&self) -> bool {
+		self.unparked.swap(false,Ordering::Relaxed)
     }
 
     pub fn reset_unparked(&self) {
@@ -205,15 +205,14 @@ where
                     debug!("delay is {:?}", delay);
 
                     // wait for the advised delay if it's greater than 100ms
-                    if delay.is_none() || delay.unwrap() > 100 {
+                    if !thread_notify.was_woken() && (delay.is_none() || delay.unwrap() > 100) {
                         unsafe {
                             sys_block_current_task_with_timeout(delay.unwrap_or(500));
-                            if thread_notify.was_unparked() {
-                                trace!("not blocking! thread_notify was already unparked");
+                            if thread_notify.swap_unparked() {
+                                debug!("not blocking! thread_notify was already unparked");
                                 sys_wakeup_task(thread_notify.thread);
-                            } else {
-                                sys_yield();
                             }
+                            sys_yield();
                         }
                     } 
 

@@ -7,12 +7,15 @@ pub mod socket;
 
 #[cfg(target_arch = "aarch64")]
 use aarch64::regs::*;
+use hermit_abi::net::event::{Event, EventFlags};
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::_rdtsc;
 use std::convert::TryInto;
+use std::mem::MaybeUninit;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::task::Poll;
+use std::time::Duration;
 use std::u16;
 
 mod smol {
@@ -105,7 +108,6 @@ extern "C" {
 }
 
 static LOCAL_ENDPOINT: AtomicU16 = AtomicU16::new(0);
-static CURRENT_SOCKET: AtomicUsize = AtomicUsize::new(1);
 
 fn local_endpoint() -> u16 {
     LOCAL_ENDPOINT.fetch_add(1, Ordering::Acquire) | 0xC000
@@ -197,49 +199,130 @@ pub(crate) fn network_init() -> io::Result<()> {
 
 /// creates a new socket (TCP/UDP/...)
 #[no_mangle]
-pub fn sys_socket(ty: abi::SocketType) -> io::Result<abi::Socket> {
-    let handle = match ty {
-        abi::SocketType::Tcp => nic::lock().with(|nic| nic.create_tcp_handle()),
-        _ => return Err(IOError!(InvalidInput, "Unsupported Socket Type")),
-    };
-    let socket = socket_map::lock().new_tcp_socket(handle,false);
-
+pub fn sys_socket() -> io::Result<abi::Socket> {
+    let socket = socket_map::lock().new_socket(
+        socket_map::Options { non_blocking: false, timeout: None }
+    );
+    run_executor();
     Ok(socket)
 }
 
-/// duplicates a socket 
+/// makes the socket non_blocking
 #[no_mangle]
-pub fn sys_socket_dup(_socket: abi::Socket) -> io::Result<abi::Socket> {
-    unimplemented!();
+pub fn sys_socket_set_timeout(socket: abi::Socket, timeout: Option<Duration>) -> io::Result<()> {
+    socket_map::lock().get_mut(socket)?.options.timeout = 
+        timeout.map(|duration| smol::Duration::from(duration));
+    Ok(())
 }
 
 /// makes the socket non_blocking
 #[no_mangle]
 pub fn sys_socket_set_non_blocking(socket: abi::Socket, non_blocking: bool) -> io::Result<()> {
-    socket_map::lock().get_mut(socket)?.non_blocking = non_blocking;
+    socket_map::lock().get_mut(socket)?.options.non_blocking = non_blocking;
     Ok(())
 }
 
 /// close a socket
 #[no_mangle]
 pub fn sys_socket_close(socket: abi::Socket) -> io::Result<()> {
-    let mut guard = socket_map::lock();
-    let entry = guard.get_mut(socket).unwrap();
-    let mut async_socket = entry.async_socket.get_tcp()?;
-    if entry.non_blocking {
-        if async_socket.is_open() {
-            async_socket.close();
-        } else {
-            async_socket.remove();
-        }
-        Ok(())
-    } else {
-        drop(guard);
-        async_socket.close();
-        block_on(async_socket.wait_for_closed(), None)??;
-        async_socket.remove();
-        Ok(())
+    run_executor();
+    let (mut async_socket, options) = socket_map::lock().take(socket)?.split();
+    async_socket.close();
+    if !options.non_blocking {
+        block_on(async_socket.wait_for_closed(), None)?;
     }
+    Ok(())
+}
+
+// ---- event ----
+
+#[no_mangle]
+pub fn sys_event_bind(socket: abi::Socket) -> io::Result<()> {
+    debug!("binding event socket");
+    socket_map::lock().bind_socket(socket,socket::AsyncEventSocket::new(None).into())?;
+    run_executor();
+    Ok(())
+}
+
+#[no_mangle]
+pub fn sys_event_add(socket: abi::Socket, event: abi::event::Event) -> io::Result<()> {
+    socket_map::lock()
+        .get_mut(socket)?
+        .async_socket
+        .get_event()?
+        .add_event(event)
+}
+
+#[no_mangle]
+pub fn sys_event_modify(socket: abi::Socket, event: abi::event::Event) -> io::Result<()> {
+    socket_map::lock()
+        .get_mut(socket)?
+        .async_socket
+        .get_event()?
+        .modify_event(event)
+}
+
+#[no_mangle]
+pub fn sys_event_remove(socket: abi::Socket, target: abi::Socket) -> io::Result<()> {
+    socket_map::lock()
+        .get_mut(socket)?
+        .async_socket
+        .get_event()?
+        .remove_socket(target)
+}
+
+#[no_mangle]
+pub fn sys_event_wait(socket: abi::Socket, events: &mut [MaybeUninit<Event>]) -> io::Result<usize> {
+    let (mut async_socket,options) = socket_map::lock().get(socket)?.split_cloned();
+    let async_socket = async_socket.get_event()?;
+    if options.non_blocking {
+        async_socket.fill_events(events)
+    } else {
+        block_on(async_socket.wait_for_events(),options.timeout)?;
+        async_socket.fill_events(events)
+    }
+}
+
+// ---- waker ----
+
+#[no_mangle]
+pub fn sys_waker_bind(socket: abi::Socket) -> io::Result<()> {
+    debug!("binding waker socket");
+    socket_map::lock().bind_socket(socket,socket::AsyncWakerSocket::new(None).into())?;
+    run_executor();
+    Ok(())
+}
+
+#[no_mangle]
+pub fn sys_waker_send_event(socket: abi::Socket, flags: abi::event::EventFlags) -> io::Result<()> {
+    socket_map::lock()
+        .get_mut(socket)?
+        .async_socket
+        .get_waker()?
+        .send_event(flags);
+    run_executor();
+    Ok(())
+}
+
+// --- tcp ---
+
+#[no_mangle]
+pub fn sys_tcp_bind(socket: abi::Socket, local: abi::SocketAddr) -> io::Result<()> {
+    debug!("binding tcp socket");
+    let local = abi_to_smol!(local => IpEndpoint);
+    let handle = nic::lock().with(|nic| {
+        if nic.iface.has_ip_addr(local.addr) {
+            Ok(nic.create_tcp_handle())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "specified address not available"
+            ))
+        }
+    })?;
+    socket_map::lock().bind_socket(socket,AsyncTcpSocket::new(None, handle, local).into())?;
+    run_executor();
+    Ok(())
 }
 
 /// make a socket listen for a connections
@@ -265,40 +348,8 @@ pub fn sys_tcp_listen(socket: abi::Socket, backlog: usize) -> Result<(), io::Err
 }
 
 #[no_mangle]
-pub fn sys_tcp_connect(socket: abi::Socket, remote: abi::SocketAddr) -> io::Result<()> {
-    let mut guard = socket_map::lock();
-    let entry = guard.get_mut(socket).unwrap();
-    let async_socket = entry.async_socket.as_tcp_mut()?;
-    let local = local_endpoint();
-    let remote = abi_to_smol!(remote => IpEndpoint);
-
-    if entry.non_blocking {
-        if !async_socket.is_open() {
-            debug!("connecting {local} to {remote}", local=local, remote=remote);
-            async_socket.connect(remote,local.into())?;
-            Err(IOError!(WouldBlock,"connect would block"))
-        } else if !async_socket.is_connected() {
-            drop(guard);
-            run_executor();
-            Err(IOError!(WouldBlock,"connect would block"))
-        } else {
-            Ok(())
-        }
-    } else {
-        let mut async_socket = async_socket.clone();
-        drop(guard);
-        debug!("connecting {local} to {remote}", local=local, remote=remote);
-        async_socket.connect(remote,local.into())?;
-        debug!("wait for connection");
-        block_on(async_socket.wait_for_connection(), None)?
-    }
-}
-
-#[no_mangle]
 pub fn sys_tcp_accept(socket: abi::Socket) -> Result<abi::Socket,io::Error> {
-    let guard = socket_map::lock();
-    let entry = guard.get(socket).unwrap();
-    let _async_socket = entry.async_socket.as_tcp_ref()?;
+    run_executor();
     unimplemented!()
     /*if info.non_blocking {
         if socket.can_recv() {
@@ -312,44 +363,94 @@ pub fn sys_tcp_accept(socket: abi::Socket) -> Result<abi::Socket,io::Error> {
     }*/
 }
 
+#[no_mangle]
+pub fn sys_tcp_connect(socket: abi::Socket, remote: abi::SocketAddr) -> io::Result<()> {
+    run_executor();
+    let (mut async_socket,options) = socket_map::lock().get(socket)?.split_cloned();
+    let async_socket = async_socket.get_tcp()?;
+    let local = local_endpoint();
+    let remote = abi_to_smol!(remote => IpEndpoint);
+
+    if options.non_blocking {
+        if !async_socket.is_open() {
+            let mut async_socket = async_socket.clone();
+            debug!("connecting {local} to {remote}", local=local, remote=remote);
+            async_socket.connect(remote,local.into())?;
+            run_executor();
+            async_socket.connect(remote,local.into())
+        } else {
+            async_socket.connect(remote,local.into())
+        }
+    } else {
+        debug!("connecting {local} to {remote}", local=local, remote=remote);
+        async_socket.connect(remote,local.into())?;
+        debug!("wait for connection");
+        block_on(async_socket.wait_for_connection(), None)?;
+        async_socket.connect(remote,local.into())
+    }
+}
+
 #[no_mangle] 
-pub fn sys_tcp_read(socket: abi::Socket, buf: &mut [u8]) -> Result<usize,io::Error> {
-    let guard = socket_map::lock();
-    let entry = guard.get(socket).unwrap();
-    let mut async_socket = entry.async_socket.get_tcp()?;
+pub fn sys_tcp_shutdown(socket: abi::Socket, mode: abi::Shutdown) -> io::Result<()> {
+    run_executor();
+    let (mut async_socket,options) = socket_map::lock().get(socket)?.split_cloned();
+    let async_socket = async_socket.get_tcp()?;
+    match mode {
+        abi::Shutdown::Read => {
+            async_socket.rclose();
+            // nothing to do since this just inhibits read operations on the socket
+            Ok(())
+        }
+        abi::Shutdown::Write => {
+            async_socket.wclose();
+            if !options.non_blocking {
+                block_on(async_socket.wait_for_remaining_packets(),options.timeout)?;
+            }
+            Ok(())
+        }
+        abi::Shutdown::Both => {
+            async_socket.rclose();
+            async_socket.wclose();
+            if !options.non_blocking {
+                block_on(async_socket.wait_for_remaining_packets(),options.timeout)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+#[no_mangle] 
+pub fn sys_tcp_read(socket: abi::Socket, buf: &mut [u8]) -> io::Result<usize> {
+    run_executor();
+    let (mut async_socket,options) = socket_map::lock().get(socket)?.split_cloned();
+    let async_socket = async_socket.get_tcp()?;
     
-    if entry.non_blocking {
-        drop(guard);
-        run_executor();
+    if options.non_blocking {
         if async_socket.can_recv() {
             async_socket.read(buf)
         } else {
             Err(IOError!(WouldBlock,"socket recv buffer empty"))
         }
     } else {
-        drop(guard);
-        block_on(async_socket.wait_for_readable(), None)??;
+        block_on(async_socket.wait_for_readable(), None)?;
         async_socket.read(buf)
     }
 }
 
 #[no_mangle] 
 pub fn sys_tcp_write(socket: abi::Socket, buf: &[u8]) -> Result<usize, io::Error> {
-    let mut guard = socket_map::lock();
-    let entry = guard.get_mut(socket).unwrap();
-    let mut async_socket = entry.async_socket.get_tcp()?;
+    run_executor();
+    let (mut async_socket,options) = socket_map::lock().get(socket)?.split_cloned();
+    let async_socket = async_socket.get_tcp()?;
 
-    if entry.non_blocking {
-        drop(guard);
-        run_executor();
+    if options.non_blocking {
         if async_socket.can_send() {
             async_socket.write(buf)
         } else {
             Err(IOError!(WouldBlock,"socket send buffer full"))
         }
     } else {
-        drop(guard);
-        block_on(async_socket.wait_for_writeable(), None)??;
+        block_on(async_socket.wait_for_writeable(), None)?;
         async_socket.write(buf)
     }   
 }
@@ -372,18 +473,28 @@ pub fn sys_tcp_stream_connect(
     let ip_address = smol::IpAddress::from_str(ip_str).map_err(|_| ())?;
     let mut async_socket = AsyncTcpSocket::from(handle);
 
-    async_socket
+    let result = async_socket
         .connect(
             (ip_address, port).into(), 
             local_endpoint().into(),
-        ).map_err(|_| ())?;
+        );
+    if result.is_err() && result.unwrap_err().kind == io::ErrorKind::WouldBlock {
+        // block on connect
         block_on(
             async_socket.wait_for_connection(),
             timeout.map(|ms| smol::Duration::from_millis(ms)),
-        )
-        .map_err(|_| { debug!("timeout"); () })?
+        ).map_err(|_| { debug!("timeout"); () }).map(|_| handle)?;
+        // check for success
+        async_socket
+            .connect(
+                (ip_address, port).into(), 
+                local_endpoint().into(),
+            )
+    } else {
+        result
+    }
         .map(|_| handle)
-        .map_err(|err| { debug!("connect failed {:?}",err); () })
+        .map_err(|_| ())
 }
 
 #[no_mangle]
@@ -393,7 +504,6 @@ pub fn sys_tcp_stream_read(
 ) -> Result<usize, ()> {
 	let mut socket = AsyncTcpSocket::from(handle);
 	block_on(socket.wait_for_readable(), None)
-        .map_err(|_| ())?
         .map_err(|_| ())?;
     socket.read(buffer).map_err(|_| ())
 }
@@ -405,7 +515,6 @@ pub fn sys_tcp_stream_write(
 ) -> Result<usize, ()> {
 	let mut socket = AsyncTcpSocket::from(handle);
 	block_on(socket.wait_for_writeable(), None)
-        .map_err(|_| ())?
         .map_err(|_| ())?;
     socket.write(buffer).map_err(|_| ())
 }
@@ -417,7 +526,6 @@ pub fn sys_tcp_stream_close(
 	let mut socket = AsyncTcpSocket::from(handle);
     socket.close();
 	block_on(socket.wait_for_closed() , None)
-        .map_err(|_| ())?
         .map_err(|_| ())
 }
 
@@ -526,17 +634,11 @@ pub fn sys_tcp_stream_peer_addr(
 pub fn sys_tcp_listener_accept(
     port: u16
 ) -> Result<(smol::SocketHandle, smol::IpAddress, u16),()> {
-    let handle = nic::lock().with(|nic| {
-        let handle = nic.create_tcp_handle();
-        nic.socket_set
-            .get::<smol::TcpSocket>(handle)
-            .listen(port);
-        handle
-    });
+    let handle = nic::lock().with(|nic| nic.create_tcp_handle());
 	let mut async_socket = AsyncTcpSocket::from(handle);
+    async_socket.listen(port.into()).map_err(|_|())?;
 	block_on(async_socket.wait_for_incoming_connection(), None)
-        .map_err(|_| { trace!("block time out");()})?
-        .map_err(|_| { trace!("wait for incoming connection failed");()})?;
+        .map_err(|_| { trace!("block time out");()})?;
     trace!("got an incoming connection on tcp_listener_accept");
 
     let remote = async_socket.accept().map_err(|_| ())?;

@@ -2,21 +2,22 @@
 // event primitives
 
 /// Event type 
-#[repr(C)]
 #[derive(Debug,Clone,Copy)]
 pub struct Event {
-    pub event_type: EventFlags,
-    pub event_socket: EventSocket,
+    pub flags: EventFlags,
+    pub socket: super::Socket,
     pub data: u64,
 } 
 
-#[repr(C)]
+/// Flags indicating which event occured
 #[derive(Debug,Clone,Copy)]
-pub struct EventFlags(u32);
-pub type EventSocket = u64;
+pub struct EventFlags(pub u32);
 
 impl EventFlags {
-    const Readable: u32 = 0b0001;
-    const Writable: u32 = 0b0010;
-    const Closed  : u32 = 0b0100;
+    pub const NONE: u32 = 0;
+
+    pub const READABLE: u32 = 0b0001;
+    pub const WRITABLE: u32 = 0b0010;
+    pub const RCLOSED: u32 = 0b0100;
+    pub const WCLOSED: u32 = 0b1000;
 }
