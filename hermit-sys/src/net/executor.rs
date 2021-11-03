@@ -31,18 +31,18 @@ lazy_static! {
 }
 
 pub(crate) fn run_executor() {
-    unsafe {
-        sys_set_network_polling_mode(true);
-    }
-    execute_all();
-    unsafe {
-        sys_set_network_polling_mode(false);
-    }
+	unsafe {
+		sys_set_network_polling_mode(true);
+	}
+	execute_all();
+	unsafe {
+		sys_set_network_polling_mode(false);
+	}
 }
 
 fn execute_all() {
 	while let Ok(runnable) = QUEUE.pop() {
-        runnable.run();
+		runnable.run();
 	}
 }
 
@@ -56,9 +56,7 @@ where
 	F: Future<Output = T> + Send + 'static,
 	T: Send + 'static,
 {
-	let schedule = |runnable| { 
-        QUEUE.push(runnable).unwrap() 
-    };
+	let schedule = |runnable| QUEUE.push(runnable).unwrap();
 	let (runnable, task) = async_task::spawn(future, schedule);
 	runnable.schedule();
 	task
@@ -69,8 +67,8 @@ struct ThreadNotify {
 	thread: Tid,
 	/// A flag to ensure a wakeup is not "forgotten" before the next `block_current_task`
 	unparked: AtomicBool,
-    /// A flag to show that a wakeup occured
-    woken: AtomicBool,
+	/// A flag to show that a wakeup occured
+	woken: AtomicBool,
 }
 
 impl ThreadNotify {
@@ -82,22 +80,22 @@ impl ThreadNotify {
 		}
 	}
 
-    pub fn was_woken(&self) -> bool {
+	pub fn was_woken(&self) -> bool {
 		self.woken.load(Ordering::Relaxed)
-    }
+	}
 
-    pub fn swap_unparked(&self) -> bool {
-		self.unparked.swap(false,Ordering::Relaxed)
-    }
+	pub fn swap_unparked(&self) -> bool {
+		self.unparked.swap(false, Ordering::Relaxed)
+	}
 
-    pub fn reset_unparked(&self) {
-        self.unparked.store(false, Ordering::Release);
-    }
+	pub fn reset_unparked(&self) {
+		self.unparked.store(false, Ordering::Release);
+	}
 
-    pub fn reset(&self) {
-        self.woken.store(false,Ordering::Relaxed);
-        self.unparked.store(false,Ordering::Release);
-    }
+	pub fn reset(&self) {
+		self.woken.store(false, Ordering::Relaxed);
+		self.unparked.store(false, Ordering::Release);
+	}
 }
 
 impl Drop for ThreadNotify {
@@ -112,8 +110,8 @@ impl Wake for ThreadNotify {
 	}
 
 	fn wake_by_ref(self: &Arc<Self>) {
-        trace!("waking thread_notify of Thread {}", self.thread);
-        self.woken.store(true,Ordering::Release);
+		trace!("waking thread_notify of Thread {}", self.thread);
+		self.woken.store(true, Ordering::Release);
 		// Make sure the wakeup is remembered until the next `park()`.
 		let unparked = self.unparked.swap(true, Ordering::Relaxed);
 		if !unparked {
@@ -144,30 +142,32 @@ where
 
 		loop {
 			if let Poll::Ready(t) = future.as_mut().poll(&mut cx) {
-                unsafe {
-                    sys_set_network_polling_mode(false);
-                }
+				unsafe {
+					sys_set_network_polling_mode(false);
+				}
 				return Ok(t);
 			} else {
-                while !thread_notify.was_woken() {
-                    trace!("polling network");
-                    let delay = network_delay(Instant::now()).map(|d| d.total_millis());
+				while !thread_notify.was_woken() {
+					trace!("polling network");
+					let delay = network_delay(Instant::now()).map(|d| d.total_millis());
 
-                    trace!("ignoring advisory delay of {:?}ms",delay);
+					trace!("ignoring advisory delay of {:?}ms", delay);
 
-                    execute_all();
+					execute_all();
 
-                    if let Some(duration) = timeout {
-                        if Instant::now() >= start + duration {
-                            unsafe {
-                                sys_set_network_polling_mode(false);
-                            }
-                            return Err(io::Error::new(io::ErrorKind::TimedOut, "executor timed out"));
-                        }
-                    }
-
-                }
-            }
+					if let Some(duration) = timeout {
+						if Instant::now() >= start + duration {
+							unsafe {
+								sys_set_network_polling_mode(false);
+							}
+							return Err(io::Error::new(
+								io::ErrorKind::TimedOut,
+								"executor timed out",
+							));
+						}
+					}
+				}
+			}
 		}
 	})
 }
@@ -184,43 +184,51 @@ where
 		let mut cx = Context::from_waker(&waker);
 		pin!(future);
 		loop {
-            thread_notify.reset();
+			thread_notify.reset();
 			if let Poll::Ready(t) = future.as_mut().poll(&mut cx) {
-                trace!("blocking future on thread {} is ready!",thread_notify.thread);
+				trace!(
+					"blocking future on thread {} is ready!",
+					thread_notify.thread
+				);
 				return Ok(t);
 			} else {
-                while !thread_notify.was_woken() {
-                    // check wheter to time out
-                    if let Some(duration) = timeout {
-                        if Instant::now() >= start + duration {
-                            return Err(io::Error::new(io::ErrorKind::TimedOut, "executor timed out"));
-                        }
-                    }
+				while !thread_notify.was_woken() {
+					// check wheter to time out
+					if let Some(duration) = timeout {
+						if Instant::now() >= start + duration {
+							return Err(io::Error::new(
+								io::ErrorKind::TimedOut,
+								"executor timed out",
+							));
+						}
+					}
 
-                    run_executor();
+					run_executor();
 
-                    // when to poll the network for progress
-                    trace!("checking network delay");
-                    let delay = network_delay(Instant::now()).map(|d| d.total_millis());
-                    debug!("delay is {:?}", delay);
+					// when to poll the network for progress
+					trace!("checking network delay");
+					let delay = network_delay(Instant::now()).map(|d| d.total_millis());
+					debug!("delay is {:?}", delay);
 
-                    // wait for the advised delay if it's greater than 100ms
-                    if !thread_notify.was_woken() && (delay.is_none() || delay.unwrap() > 100) {
-                        unsafe {
-                            sys_block_current_task_with_timeout(delay.unwrap_or(500));
-                            if thread_notify.swap_unparked() {
-                                debug!("not blocking! thread_notify was already unparked");
-                                sys_wakeup_task(thread_notify.thread);
-                            }
-                            sys_yield();
-                        }
-                    } 
+					// wait for the advised delay if it's greater than 100ms
+					if !thread_notify.was_woken() && (delay.is_none() || delay.unwrap() > 100) {
+						unsafe {
+							sys_block_current_task_with_timeout(delay.unwrap_or(500));
+							if thread_notify.swap_unparked() {
+								debug!("not blocking! thread_notify was already unparked");
+								sys_wakeup_task(thread_notify.thread);
+							}
+							sys_yield();
+						}
+					}
 
-                    // now wake nic so it may poll
-                    nic::lock().with(|nic| nic.wake());
-                }
-            }
-            trace!("thread_notify was woken!");
-        }
+					run_executor();
+
+					// now wake nic so it may poll
+					nic::lock().with(|nic| nic.wake());
+				}
+			}
+			trace!("thread_notify was woken!");
+		}
 	})
 }

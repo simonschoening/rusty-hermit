@@ -1,4 +1,4 @@
-//! `tcplistener` provide an interface to establish tcp socket server.
+//! `tcplistener` provides an interface to establish a tcp socket server.
 
 use crate::{Handle, IpAddress};
 

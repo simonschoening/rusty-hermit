@@ -1,34 +1,36 @@
-use std::sync::{Mutex,MutexGuard};
-use std::task::{Context,Waker};
-use crate::net::waker::WakerRegistration;
 use crate::net::device::HermitNet;
-use smoltcp::phy::Device;
-use smoltcp::iface::EthernetInterface;
-use smoltcp::socket::{SocketSet,SocketHandle,TcpSocket,TcpSocketBuffer};
+use crate::net::waker::WakerRegistration;
 use concurrent_queue::ConcurrentQueue;
+use smoltcp::dhcp::Dhcpv4Client;
+use smoltcp::iface::EthernetInterface;
+use smoltcp::phy::Device;
+use smoltcp::socket::{SocketHandle, SocketSet, TcpSocket, TcpSocketBuffer};
+use smoltcp::wire::{IpCidr, Ipv4Address, Ipv4Cidr};
+use std::sync::{Mutex, MutexGuard};
+use std::task::{Context, Waker};
 
 lazy_static! {
 	static ref NIC: Mutex<NetworkState> = Mutex::new(NetworkState::Missing);
-    static ref WAKER: ConcurrentQueue<Waker> = ConcurrentQueue::unbounded();
+	static ref WAKER: ConcurrentQueue<Waker> = ConcurrentQueue::unbounded();
 }
 
 /// lock the global NetworkState
 ///
 /// This will panic if the network mutex is poisoned
-pub(crate)fn lock() -> MutexGuard<'static,NetworkState> {
-    NIC.lock().expect("Network State poisoned")
+pub(crate) fn lock() -> MutexGuard<'static, NetworkState> {
+	NIC.lock().expect("Network State poisoned")
 }
 
-pub(crate)fn register_waker(waker: &Waker) {
-    WAKER.push(waker.clone()).unwrap();
+pub(crate) fn register_waker(waker: &Waker) {
+	WAKER.push(waker.clone()).unwrap();
 }
 
 fn wake_any() {
-    // wake any future waiting on socket changes on which smoltcp does not report by itself
-    while let Ok(waker) = WAKER.pop() {
-        trace!("waking a 'WakeOn::Any' future");
-        waker.wake();
-    }
+	// wake any future waiting on socket changes on which smoltcp does not report by itself
+	while let Ok(waker) = WAKER.pop() {
+		trace!("waking a 'WakeOn::Any' future");
+		waker.wake();
+	}
 }
 
 pub(crate) enum NetworkState {
@@ -38,15 +40,15 @@ pub(crate) enum NetworkState {
 }
 
 impl NetworkState {
-    pub(crate)fn with<F,R>(&mut self, f: F) -> R 
-    where
-        F: FnOnce(&mut NetworkInterface<HermitNet>) -> R,
-    {
+	pub(crate) fn with<F, R>(&mut self, f: F) -> R
+	where
+		F: FnOnce(&mut NetworkInterface<HermitNet>) -> R,
+	{
 		match self {
 			NetworkState::Initialized(nic) => f(nic),
 			_ => panic!("Network Interface not found"),
 		}
-    }
+	}
 }
 
 pub(crate) struct NetworkInterface<T: for<'a> Device<'a>> {
@@ -66,34 +68,37 @@ impl<T> NetworkInterface<T>
 where
 	T: for<'a> Device<'a>,
 {
-	pub(crate) fn with_tcp_socket_ref<F,R>(&mut self, handle: SocketHandle, f: F) -> R
-    where
-        F: FnOnce(&TcpSocket) -> R
-    {
-        let mut socket = self.socket_set.get::<TcpSocket>(handle);
-        f(&*socket)
-    }
+	pub(crate) fn with_tcp_socket_ref<F, R>(&mut self, handle: SocketHandle, f: F) -> R
+	where
+		F: FnOnce(&TcpSocket) -> R,
+	{
+		let mut socket = self.socket_set.get::<TcpSocket>(handle);
+		f(&*socket)
+	}
 
-	pub(crate) fn with_tcp_socket_mut<F,R>(&mut self, handle: SocketHandle, f: F) -> R
-    where
-        F: FnOnce(&mut TcpSocket) -> R
-    {
-        let mut socket = self.socket_set.get::<TcpSocket>(handle);
-        f(&mut*socket)
-    }
+	pub(crate) fn with_tcp_socket_mut<F, R>(&mut self, handle: SocketHandle, f: F) -> R
+	where
+		F: FnOnce(&mut TcpSocket) -> R,
+	{
+		let mut socket = self.socket_set.get::<TcpSocket>(handle);
+		f(&mut *socket)
+	}
 
-    pub(crate) fn create_tcp_handle(&mut self) -> SocketHandle {
+	pub(crate) fn create_tcp_handle(&mut self) -> SocketHandle {
 		let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; 65535]);
 		let tcp_tx_buffer = TcpSocketBuffer::new(vec![0; 65535]);
 		let tcp_socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
-        self.socket_set.add(tcp_socket)
-    }
+		self.socket_set.add(tcp_socket)
+	}
 
 	pub(crate) fn wake(&mut self) {
-        // wake the network future
-        debug!("nic has {} sockets in socket_set", self.socket_set.iter().count());
+		// wake the network future
+		debug!(
+			"nic has {} sockets in socket_set",
+			self.socket_set.iter().count()
+		);
 		self.waker.wake();
-        wake_any();
+		wake_any();
 	}
 
 	fn poll_common(&mut self, timestamp: smoltcp::time::Instant) {
@@ -102,12 +107,12 @@ where
 			.poll(&mut self.socket_set, timestamp.into())
 			.unwrap_or(true)
 		{
-            // make progress
+			// make progress
 		}
 		#[cfg(feature = "dhcpv4")]
 		let config = self
 			.dhcp
-			.poll(&mut self.iface, &mut self.sockets, timestamp)
+			.poll(&mut self.iface, &mut self.socket_set, timestamp)
 			.unwrap_or_else(|e| {
 				debug!("DHCP: {:?}", e);
 				None
@@ -155,7 +160,10 @@ where
 		self.poll_common(timestamp);
 	}
 
-	pub(crate) fn poll_delay(&mut self, timestamp: smoltcp::time::Instant) -> Option<smoltcp::time::Duration> {
+	pub(crate) fn poll_delay(
+		&mut self,
+		timestamp: smoltcp::time::Instant,
+	) -> Option<smoltcp::time::Duration> {
 		self.iface.poll_delay(&self.socket_set, timestamp)
 	}
 }

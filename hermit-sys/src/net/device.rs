@@ -24,8 +24,8 @@ use smoltcp::wire::IpAddress;
 use smoltcp::wire::Ipv4Cidr;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address};
 
-use crate::net::waker::WakerRegistration;
 use crate::net::nic::{NetworkInterface, NetworkState};
+use crate::net::waker::WakerRegistration;
 
 extern "Rust" {
 	fn sys_get_mac_address() -> Result<[u8; 6], ()>;
@@ -83,7 +83,12 @@ impl NetworkInterface<HermitNet> {
 		let mut socket_set = SocketSet::new(vec![]);
 		let dhcp_rx_buffer = RawSocketBuffer::new([RawPacketMetadata::EMPTY; 1], vec![0; 900]);
 		let dhcp_tx_buffer = RawSocketBuffer::new([RawPacketMetadata::EMPTY; 1], vec![0; 600]);
-		let dhcp = Dhcpv4Client::new(&mut socket_set, dhcp_rx_buffer, dhcp_tx_buffer, Instant::now());
+		let dhcp = Dhcpv4Client::new(
+			&mut socket_set,
+			dhcp_rx_buffer,
+			dhcp_tx_buffer,
+			Instant::now(),
+		);
 		let prev_cidr = Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0);
 
 		let iface = EthernetInterfaceBuilder::new(device)
@@ -93,13 +98,13 @@ impl NetworkInterface<HermitNet> {
 			.routes(routes)
 			.finalize();
 
-		NetworkState::Initialized(Mutex::new(Self {
+		NetworkState::Initialized(Self {
 			iface,
 			socket_set,
 			dhcp,
 			prev_cidr,
 			waker: WakerRegistration::new(),
-		}))
+		})
 	}
 
 	#[cfg(not(feature = "dhcpv4"))]

@@ -5,8 +5,8 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::result_unit_err)]
 
-extern crate libc;
 extern crate core;
+extern crate libc;
 
 // legacy networking (consider marking as deprecated)
 #[cfg(feature = "bindings")]
@@ -74,7 +74,7 @@ pub const O_APPEND: i32 = 0o2000;
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 pub struct timespec {
-    //        ^ ToDo: make this CamelCase
+	//        ^ ToDo: make this CamelCase
 	/// seconds
 	pub tv_sec: i64,
 	/// nanoseconds

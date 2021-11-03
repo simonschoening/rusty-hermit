@@ -1,5 +1,5 @@
-use libc::c_void;
 use super::*;
+use libc::c_void;
 
 // symbols, which are part of the library operating system
 

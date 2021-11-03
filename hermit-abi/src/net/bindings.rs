@@ -1,8 +1,8 @@
 use crate::io::Result;
 use crate::net::event::{Event, EventFlags};
 use crate::net::{Shutdown, Socket, SocketAddr};
-use core::time::Duration;
 use core::mem::MaybeUninit;
+use core::time::Duration;
 
 extern "Rust" {
 	// Socket
