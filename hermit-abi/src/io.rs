@@ -3,12 +3,13 @@ pub type Result<T> = core::result::Result<T, Error>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error {
 	pub kind: ErrorKind,
-	pub msg: &'static str,
+    // make it a thin pointer
+	pub msg: &'static &'static str,
 }
 
 impl Error {
 	/// create a new io error
-	pub fn new(kind: ErrorKind, msg: &'static str) -> Self {
+	pub fn new(kind: ErrorKind, msg: &'static &'static str) -> Self {
 		Self { kind, msg }
 	}
 }
@@ -30,8 +31,6 @@ pub enum ErrorKind {
 	ConnectionRefused,
 	/// connection reset by peer
 	ConnectionReset,
-	/// connection aborted by peer
-	ConnectionAborted,
 	/// tried to read from or write to unconnected socket
 	NotConnected,
 	/// address/port requested already in use

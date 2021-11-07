@@ -7,11 +7,11 @@ publish = false
 
 [target.'cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), target_os = "hermit"))'.dependencies]
 hermit-sys = { path = "../../hermit-sys", default-features = false, features = ["with_submodule"] }
-hermit-abi = { path = "../../hermit-abi", default-features = false, features = ["bindings"] }
+hermit-abi = { path = "../../hermit-abi" }
 
 [features]
 default = ["pci", "acpi", "net"]
-net = ["hermit-sys/net","hermit-abi/net"]
+net = ["hermit-sys/net"]
 vga = ["hermit-sys/vga"]
 pci = ["hermit-sys/pci"]
 acpi = ["hermit-sys/acpi"]

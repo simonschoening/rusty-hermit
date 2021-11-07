@@ -5,9 +5,6 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::result_unit_err)]
 
-extern crate core;
-extern crate libc;
-
 // legacy networking (consider marking as deprecated)
 #[cfg(feature = "bindings")]
 pub mod tcplistener;
@@ -15,7 +12,6 @@ pub mod tcplistener;
 pub mod tcpstream;
 
 /// networking primitives
-#[cfg(feature = "net")]
 pub mod net;
 
 /// hermit io types

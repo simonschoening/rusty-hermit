@@ -1,25 +1,21 @@
-use abi::net::event::*;
-use abi::net::*;
-use core::mem::MaybeUninit;
-use hermit_abi as abi;
+use std::{io::Write, net::TcpListener, time::Duration};
 
 #[allow(unused_imports)]
 extern crate hermit_sys;
 
-fn main() {
-    let listener = socket().unwrap();
-    tcp_bind(listener,SocketAddr::V4(SocketAddrV4 {
-        ip_addr: Ipv4Addr::UNSPECIFIED,
-        port: 9900
-    })).unwrap();
-    tcp_listen(listener, 16).unwrap();
+fn main() -> std::io::Result<()> {
+    let listener = TcpListener::bind("0.0.0.0:9900")?;
     println!("listening on port 9900");
 
 	for i in 1.. {
-        let stream = tcp_accept(listener).unwrap();
+        let (mut stream,remote) = listener.accept()?;
 
-        println!("client no. {} connected", i);
+        println!("client no. {} connected from {}", i, remote);
 
-        socket_close(stream).unwrap();
+        stream.write(b"Hello from rusty hermit\n")?;
+
+        std::thread::sleep(Duration::from_secs(1));
 	}
+
+    Ok(())
 }

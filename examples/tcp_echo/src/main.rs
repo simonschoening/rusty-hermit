@@ -140,6 +140,8 @@ fn main() {
 			println!("done");
 		}
 
+        socket_close(event_socket).unwrap();
+
 		unsafe {
 			abi::usleep(100_000);
 		}
