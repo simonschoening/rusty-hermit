@@ -1,5 +1,7 @@
 #[cfg(target_arch = "aarch64")]
 use aarch64::regs::*;
+#[cfg(target_arch = "riscv64")]
+use riscv::register::time;
 use std::env;
 use std::f64::consts::{E, PI};
 use std::ffi::c_void;
@@ -37,6 +39,12 @@ fn get_timestamp() -> u64 {
 #[inline]
 fn get_timestamp() -> u64 {
 	CNTPCT_EL0.get()
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline]
+fn get_timestamp() -> u64 {
+	time::read64()
 }
 
 extern "C" {

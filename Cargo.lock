@@ -468,6 +468,7 @@ dependencies = [
  "aarch64",
  "hermit-sys",
  "rayon",
+ "riscv",
  "syscalls",
 ]
 
