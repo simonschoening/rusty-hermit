@@ -1,26 +1,139 @@
-use hermit_abi::io;
-use hermit_abi::net::event::EventFlags;
-use hermit_abi::net::Socket;
 use std::task::Waker;
+use smoltcp::socket::SocketHandle;
+use crate::net::{nic,poll};
+use hermit_abi::{io,net};
 
 pub(crate) mod event;
 pub(crate) mod tcp;
-pub(crate) mod tcp_backlog;
 pub(crate) mod waker;
 
 pub(crate) use event::AsyncEventSocket;
 pub(crate) use tcp::AsyncTcpSocket;
-pub(crate) use tcp_backlog::AsyncTcpBacklog;
 pub(crate) use waker::AsyncWakerSocket;
 
+use super::socket_map;
+
+#[derive(Debug)]
+pub(crate) struct HandleWrapper(SocketHandle);
+
+impl HandleWrapper {
+    pub(crate) fn new(handle: SocketHandle) -> Self {
+        Self(handle)
+    }
+
+    pub(crate) fn inner(&self) -> SocketHandle {
+        self.0
+    }
+
+    pub(crate) fn into_inner(self) -> SocketHandle {
+        let handle = self.0;
+        std::mem::forget(self);
+        handle
+    }
+}
+
+impl Clone for HandleWrapper {
+    fn clone(&self) -> Self {
+        nic::lock().with(|nic| nic.socket_set.retain(self.inner()));
+        Self::new(self.inner())
+    }
+}
+
+impl Drop for HandleWrapper {
+    fn drop(&mut self) {
+        nic::lock().with(|nic| nic.socket_set.release(self.inner()));
+    }
+}
+
+pub(crate) trait SocketProxy<S> {
+    fn with_ref<F,T>(&mut self, f: F) -> io::Result<T>
+    where
+        F: FnMut(&S) -> io::Result<T>;
+    fn with_mut<F,T>(&mut self, f: F) -> io::Result<T>
+    where
+        F: FnMut(&mut S) -> io::Result<T>;
+}
+
+pub(crate) struct AsyncSocketProxy<R,M> {
+    socket: net::Socket,
+    as_ref: R,
+    as_mut: M,
+}
+
+impl<R,M> AsyncSocketProxy<R,M> {
+    pub(crate) fn new(socket: net::Socket, as_ref: R, as_mut: M) -> Self {
+        Self { socket, as_ref, as_mut }
+    }
+}
+
+impl<S,R,M> SocketProxy<S> for AsyncSocketProxy<R,M>
+where
+    S: Socket,
+    R: FnMut(&AsyncSocket) -> io::Result<&S>,
+    M: FnMut(&mut AsyncSocket) -> io::Result<&mut S>,
+{
+    fn with_ref<F,T>(&mut self, f: F) -> io::Result<T> 
+    where
+        F: FnOnce(&S) -> io::Result<T>,
+    {
+        let guard = socket_map::lock();
+        let async_socket = &guard.get(self.socket)?.async_socket;
+        let inner = (self.as_ref)(async_socket)?;
+        f(inner)
+    }
+
+    fn with_mut<F,T>(&mut self, f: F) -> io::Result<T> 
+    where
+        F: FnOnce(&mut S) -> io::Result<T>,
+    {
+        let mut guard = socket_map::lock();
+        let async_socket = &mut guard.get_mut(self.socket)?.async_socket;
+        let inner = (self.as_mut)(async_socket)?;
+        f(inner)
+    }
+}
+
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum AsyncSocket {
 	Unbound,
 	Tcp(AsyncTcpSocket),
-	TcpBacklog(AsyncTcpBacklog),
 	Event(AsyncEventSocket),
 	Waker(AsyncWakerSocket),
+}
+
+pub(crate) trait Socket {
+    /// register a send waker (this waker is unique)
+    fn register_send_waker(&mut self, waker: &Waker) -> Option<(Vec<net::Socket>,Vec<net::Socket>)>;
+    /// register a recv waker (this waker is unique)
+    fn register_recv_waker(&mut self, waker: &Waker) -> Option<(Vec<net::Socket>,Vec<net::Socket>)>;
+    /// get the eventflags for this socket
+	fn get_event_flags(&mut self) -> net::event::EventFlags;
+    /// update state on any wake event
+    ///
+    /// by default this does nothing
+    fn update(&mut self) {}
+    /// tell the socket we want to close, but don't free resources yet
+    ///
+    /// by default this does nothing
+    fn init_close(&mut self) {}
+    /// may we hard close this socket?
+    ///
+    /// by default this returns true
+    fn may_close(&self) -> bool { true }
+    /// close the socket. now resources may be freed
+    fn close(&mut self);
+    /// has close finished 
+    ///
+    /// if we want to support something similar to SO_LINGER on unix
+    /// we may want to wait until the socket is really closed
+    ///
+    /// by default this returns true
+    fn is_closed(&self) -> bool { true }
+}
+
+pub(crate) async fn close(socket: net::Socket) {
+    unimplemented!()
 }
 
 impl AsyncSocket {
@@ -28,117 +141,117 @@ impl AsyncSocket {
 		Self::Unbound
 	}
 
-	pub(crate) fn set_socket(&mut self, socket: Socket) {
+	pub(crate) fn as_socket_ref(&self) -> io::Result<&dyn Socket> {
 		match self {
-			Self::Unbound => (),
-			Self::Tcp(tcp) => tcp.set_socket(socket),
-			Self::TcpBacklog(tcp_backlog) => tcp_backlog.set_socket(socket),
-			Self::Event(event) => event.set_socket(socket),
-			Self::Waker(waker) => waker.set_socket(socket),
+			Self::Unbound => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    &"this socket is unbound"
+                )),
+			Self::Tcp(tcp) => Ok(tcp),
+			Self::Event(event) => Ok(event),
+			Self::Waker(waker) => Ok(waker),
 		}
 	}
 
-	pub(crate) fn get_event_flags(&self) -> EventFlags {
+	pub(crate) fn as_socket_mut(&mut self) -> io::Result<&mut dyn Socket> {
 		match self {
-			Self::Unbound => EventFlags(EventFlags::NONE),
-			Self::Tcp(tcp) => tcp.get_event_flags(),
-			Self::TcpBacklog(tcp_backlog) => tcp_backlog.get_event_flags(),
-			Self::Event(event) => event.get_event_flags(),
-			Self::Waker(waker) => waker.get_event_flags(),
+			Self::Unbound => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    &"this socket is unbound"
+                )),
+			Self::Tcp(tcp) => Ok(tcp),
+			Self::Event(event) => Ok(event),
+			Self::Waker(waker) => Ok(waker),
 		}
 	}
 
-	pub(crate) fn register_exclusive_send_waker(&mut self, waker: &Waker) {
+	pub(crate) fn as_tcp_ref(&self) -> io::Result<&AsyncTcpSocket> {
 		match self {
-			Self::Unbound => (),
-			Self::Tcp(tcp) => tcp.register_exclusive_send_waker(waker),
-			Self::TcpBacklog(tcp_backlog) => tcp_backlog.register_exclusive_send_waker(waker),
-			Self::Event(_) => (),
-			Self::Waker(wake) => wake.register_exclusive_send_waker(waker),
+			Self::Tcp(tcp) => Ok(tcp),
+			_ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    &"not a tcp socket"
+                )),
 		}
 	}
 
-	pub(crate) fn register_exclusive_recv_waker(&mut self, waker: &Waker) {
+	pub(crate) fn as_tcp_mut(&mut self) -> io::Result<&mut AsyncTcpSocket> {
 		match self {
-			Self::Unbound => (),
-			Self::Tcp(tcp) => tcp.register_exclusive_recv_waker(waker),
-			Self::TcpBacklog(tcp_backlog) => tcp_backlog.register_exclusive_recv_waker(waker),
-			Self::Event(event) => event.register_exclusive_recv_waker(waker),
-			Self::Waker(wake) => wake.register_exclusive_recv_waker(waker),
+			Self::Tcp(tcp) => Ok(tcp),
+			_ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    &"not a tcp socket"
+                )),
 		}
 	}
 
-	pub(crate) fn close(&mut self) {
+	pub(crate) fn as_tcp_proxy(&self, socket: net::Socket) -> io::Result<impl SocketProxy<AsyncTcpSocket>> {
 		match self {
-			Self::Unbound => (),
-			Self::Tcp(tcp) => tcp.close(),
-			Self::TcpBacklog(tcp_backlog) => tcp_backlog.close(),
-			Self::Event(_) => (),
-			Self::Waker(waker) => waker.close(),
+			Self::Tcp(tcp) => Ok(AsyncSocketProxy::new(socket, Self::as_tcp_ref, Self::as_tcp_mut)),
+			_ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    &"not a tcp socket"
+                )),
 		}
 	}
 
-	pub(crate) async fn wait_for_closed(&self) {
+	pub(crate) fn as_event_ref(&self) -> io::Result<&AsyncEventSocket> {
 		match self {
-			Self::Unbound => (),
-			Self::Tcp(tcp) => {
-				tcp.wait_for_closed().await;
-			}
-			Self::TcpBacklog(tcp_backlog) => tcp_backlog.wait_for_closed().await,
-			Self::Event(_) => (),
-			Self::Waker(_) => (),
+			Self::Event(event) => Ok(event),
+			_ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    &"not a tcp listener"
+                )),
 		}
 	}
 
-	// ---- tcp ----
-
-	pub(crate) fn get_tcp(&mut self) -> io::Result<&mut AsyncTcpSocket> {
-		if let AsyncSocket::Tcp(tcp) = self {
-			Ok(tcp)
-		} else {
-			Err(io::Error::new(
-				io::ErrorKind::InvalidData,
-				"Not a tcp socket",
-			))
+	pub(crate) fn as_event_mut(&mut self) -> io::Result<&mut AsyncEventSocket> {
+		match self {
+			Self::Event(event) => Ok(event),
+			_ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    &"not a tcp listener"
+                )),
 		}
 	}
 
-	// ---- tcp backlog ----
-
-	pub(crate) fn get_tcp_backlog(&mut self) -> io::Result<&mut AsyncTcpBacklog> {
-		if let AsyncSocket::TcpBacklog(tcp) = self {
-			Ok(tcp)
-		} else {
-			Err(io::Error::new(
-				io::ErrorKind::InvalidData,
-				"Not a tcp listener",
-			))
+	pub(crate) fn as_event_proxy(&self, socket: net::Socket) -> io::Result<impl SocketProxy<AsyncEventSocket>> {
+		match self {
+			Self::Event(event) => Ok(AsyncSocketProxy::new(socket, Self::as_event_ref, Self::as_event_mut)),
+			_ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    &"not an event socket"
+                )),
 		}
 	}
 
-	// ---- event ----
-
-	pub(crate) fn get_event(&mut self) -> io::Result<&mut AsyncEventSocket> {
-		if let AsyncSocket::Event(event) = self {
-			Ok(event)
-		} else {
-			Err(io::Error::new(
-				io::ErrorKind::InvalidData,
-				"Not an event socket",
-			))
+	pub(crate) fn as_waker_ref(&self) -> io::Result<&AsyncWakerSocket> {
+		match self {
+			Self::Waker(waker) => Ok(waker),
+			_ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    &"not a tcp listener"
+                )),
 		}
 	}
 
-	// ---- waker ----
+	pub(crate) fn as_waker_mut(&mut self) -> io::Result<&mut AsyncWakerSocket> {
+		match self {
+			Self::Waker(waker) => Ok(waker),
+			_ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    &"not a tcp listener"
+                )),
+		}
+	}
 
-	pub(crate) fn get_waker(&mut self) -> io::Result<&mut AsyncWakerSocket> {
-		if let AsyncSocket::Waker(waker) = self {
-			Ok(waker)
-		} else {
-			Err(io::Error::new(
-				io::ErrorKind::InvalidData,
-				"Not a waker socket",
-			))
+	pub(crate) fn as_waker_proxy(&self, socket: net::Socket) -> io::Result<impl SocketProxy<AsyncWakerSocket>> {
+		match self {
+			Self::Waker(waker) => Ok(AsyncSocketProxy::new(socket, Self::as_waker_ref, Self::as_waker_mut)),
+			_ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    &"not an event socket"
+                )),
 		}
 	}
 }
@@ -146,12 +259,6 @@ impl AsyncSocket {
 impl From<AsyncTcpSocket> for AsyncSocket {
 	fn from(socket: AsyncTcpSocket) -> Self {
 		Self::Tcp(socket)
-	}
-}
-
-impl From<AsyncTcpBacklog> for AsyncSocket {
-	fn from(backlog: AsyncTcpBacklog) -> Self {
-		Self::TcpBacklog(backlog)
 	}
 }
 

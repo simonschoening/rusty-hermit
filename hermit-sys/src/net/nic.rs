@@ -1,10 +1,13 @@
 use crate::net::device::HermitNet;
 use crate::net::waker::WakerRegistration;
+use crate::net::socket::HandleWrapper;
 use concurrent_queue::ConcurrentQueue;
+#[cfg(feature = "dhcpv4")]
 use smoltcp::dhcp::Dhcpv4Client;
 use smoltcp::iface::EthernetInterface;
 use smoltcp::phy::Device;
-use smoltcp::socket::{SocketHandle, SocketSet, TcpSocket, TcpSocketBuffer};
+use smoltcp::socket::{AnySocket, SocketSet, TcpSocket, TcpSocketBuffer};
+#[cfg(feature = "dhcpv4")]
 use smoltcp::wire::{IpCidr, Ipv4Address, Ipv4Cidr};
 use std::sync::{Mutex, MutexGuard};
 use std::task::{Context, Waker};
@@ -68,28 +71,29 @@ impl<T> NetworkInterface<T>
 where
 	T: for<'a> Device<'a>,
 {
-	pub(crate) fn with_tcp_socket_ref<F, R>(&mut self, handle: SocketHandle, f: F) -> R
+	pub(crate) fn with_ref<S: AnySocket<'static>, F, R>(&mut self, handle: &HandleWrapper, f: F) -> R
 	where
-		F: FnOnce(&TcpSocket) -> R,
+		F: FnOnce(&S) -> R,
 	{
-		let mut socket = self.socket_set.get::<TcpSocket>(handle);
+		let socket = self.socket_set.get::<S>(handle.inner());
 		f(&*socket)
 	}
 
-	pub(crate) fn with_tcp_socket_mut<F, R>(&mut self, handle: SocketHandle, f: F) -> R
+	pub(crate) fn with_mut<S: AnySocket<'static>, F, R>(&mut self, handle: &HandleWrapper, f: F) -> R
 	where
-		F: FnOnce(&mut TcpSocket) -> R,
+		F: FnOnce(&mut S) -> R,
 	{
-		let mut socket = self.socket_set.get::<TcpSocket>(handle);
+		let mut socket = self.socket_set.get::<S>(handle.inner());
 		f(&mut *socket)
 	}
 
-	pub(crate) fn create_tcp_handle(&mut self) -> SocketHandle {
+	pub(crate) fn create_tcp_handle(&mut self) -> HandleWrapper {
 		let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; 65535]);
 		let tcp_tx_buffer = TcpSocketBuffer::new(vec![0; 65535]);
 		let tcp_socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
         trace!("creating tcp handle");
-		self.socket_set.add(tcp_socket)
+		let handle = self.socket_set.add(tcp_socket);
+        HandleWrapper::new(handle)
 	}
 
 	pub(crate) fn wake(&mut self) {

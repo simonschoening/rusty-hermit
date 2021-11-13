@@ -3,6 +3,7 @@ pub mod executor;
 pub mod nic;
 pub mod socket;
 pub mod socket_map;
+pub mod poll;
 pub mod waker;
 
 #[cfg(target_arch = "aarch64")]
@@ -24,7 +25,7 @@ mod smol {
 	#[cfg(feature = "trace")]
 	pub use smoltcp::phy::EthernetTracer;
 	#[cfg(feature = "dhcpv4")]
-	pub use smoltcp::wire::{IpCidr, Ipv4Address, Ipv4Cidr};
+	pub use smoltcp::wire::{IpCidr, Ipv4Cidr};
 
 	pub use smoltcp::iface::EthernetInterface;
 	pub use smoltcp::phy::Device;
@@ -32,7 +33,7 @@ mod smol {
 		Socket, SocketHandle, SocketSet, TcpSocket, TcpSocketBuffer, TcpState,
 	};
 	pub use smoltcp::time::{Duration, Instant};
-	pub use smoltcp::wire::{IpAddress, IpEndpoint};
+	pub use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address, IpEndpoint};
 	pub use smoltcp::Error;
 }
 
@@ -43,6 +44,8 @@ use futures_lite::future;
 use crate::net::device::HermitNet;
 use crate::net::executor::{block_on, run_executor, spawn};
 use crate::net::socket::AsyncTcpSocket;
+
+use self::socket::SocketProxy;
 
 macro_rules! abi_to_smol {
     ($expr:expr => IpEndpoint) => {
@@ -79,6 +82,49 @@ macro_rules! abi_to_smol {
         {
             let ip = $expr;
             smol::IpAddress::v6(ip.a, ip.b, ip.c, ip.d, ip.e, ip.f, ip.g, ip.h)
+        }
+    }
+}
+
+macro_rules! smol_to_abi {
+    ($expr:expr => SocketAddr) => {
+        {
+            let smol::IpEndpoint { addr, port } = $expr;
+            match addr {
+                smol::IpAddress::Ipv4(ipv4) => abi::SocketAddr::V4(abi::SocketAddrV4{
+                    ip_addr: smol_to_abi!(ipv4 => Ipv4Addr), 
+                    port,
+                }),
+                smol::IpAddress::Ipv6(ipv6) => abi::SocketAddr::V6(abi::SocketAddrV6 {
+                    ip_addr: smol_to_abi!(ipv6 => Ipv6Addr), 
+                    port,
+                    flowinfo: 0,
+                    scope_id: 0,
+                }),
+                _ => abi::SocketAddr::V4(abi::SocketAddrV4::UNSPECIFIED),
+            }
+        }
+    };
+    ($expr:expr => IpAddr) => {
+        match addr {
+            smol::IpAddress::Unspecified => abi::IpAddr::V4(abi::SocketAddrV4::UNSPECIFIED),
+            smol::IpAddress::Ipv4(ipv4) => abi::IpAddr::V4(smol_to_abi!(ipv4 => Ipv4Address)),
+            smol::IpAddress::Ipv6(ipv6) => abi::IpAddr::V6(smol_to_abi!(ipv6 => Ipv6Address)),
+        }
+    };
+    ($expr:expr => Ipv4Addr) => {
+        {
+            let smol::Ipv4Address([a,b,c,d]) = $expr;
+            abi::Ipv4Addr { a,b,c,d }
+        }
+    };
+    ($expr:expr => Ipv6Addr) => {
+        {
+            let mut buffer = [0u16;8];
+            let ip: smol::Ipv6Address = $expr;
+            ip.write_parts(&mut buffer);
+            let [a,b,c,d,e,f,g,h] = buffer;
+            abi::Ipv6Addr { a,b,c,d,e,f,g,h }
         }
     }
 }
@@ -192,6 +238,12 @@ pub fn sys_socket_set_timeout(socket: abi::Socket, timeout: Option<Duration>) ->
 	Ok(())
 }
 
+#[no_mangle]
+pub fn sys_socket_timeout(socket: abi::Socket) -> io::Result<Option<Duration>> {
+	Ok(socket_map::lock().get_mut(socket)?.options.timeout
+       .map(|timeout| timeout.into()))
+}
+
 /// makes the socket non_blocking
 #[no_mangle]
 pub fn sys_socket_set_non_blocking(socket: abi::Socket, non_blocking: bool) -> io::Result<()> {
@@ -199,14 +251,31 @@ pub fn sys_socket_set_non_blocking(socket: abi::Socket, non_blocking: bool) -> i
 	Ok(())
 }
 
+#[no_mangle]
+pub fn sys_socket_non_blocking(socket: abi::Socket) -> io::Result<bool> {
+	Ok(socket_map::lock().get_mut(socket)?.options.non_blocking)
+}
+
 /// close a socket
 #[no_mangle]
 pub fn sys_socket_close(socket: abi::Socket) -> io::Result<()> {
 	run_executor();
-	let (mut async_socket, options) = socket_map::lock().take(socket)?.split();
-	async_socket.close();
-	if !options.non_blocking {
-		block_on(async_socket.wait_for_closed(), None)?;
+    let options = { 
+        let mut guard = socket_map::lock();
+        let (async_socket, options) = guard
+            .get_mut(socket)?
+            .split_mut();
+        let async_socket = match async_socket.as_socket_mut() {
+            Ok(s) => s,
+            Err(_) => return Ok(()),
+        };
+        async_socket.init_close();
+        *options
+    };
+	if options.non_blocking {
+		spawn(socket::close(socket)).detach();
+	} else {
+		block_on(socket::close(socket), None)?;
 	}
 	Ok(())
 }
@@ -216,7 +285,7 @@ pub fn sys_socket_close(socket: abi::Socket) -> io::Result<()> {
 #[no_mangle]
 pub fn sys_event_bind(socket: abi::Socket) -> io::Result<()> {
 	debug!("binding event socket");
-	socket_map::lock().bind_socket(socket, socket::AsyncEventSocket::new(None).into())?;
+	socket_map::lock().bind_socket(socket, socket::AsyncEventSocket::new().into())?;
 	run_executor();
 	Ok(())
 }
@@ -226,7 +295,7 @@ pub fn sys_event_add(socket: abi::Socket, event: abi::event::Event) -> io::Resul
 	socket_map::lock()
 		.get_mut(socket)?
 		.async_socket
-		.get_event()?
+		.as_event_mut()?
 		.add_event(event)
 }
 
@@ -235,7 +304,7 @@ pub fn sys_event_modify(socket: abi::Socket, event: abi::event::Event) -> io::Re
 	socket_map::lock()
 		.get_mut(socket)?
 		.async_socket
-		.get_event()?
+		.as_event_mut()?
 		.modify_event(event)
 }
 
@@ -244,20 +313,48 @@ pub fn sys_event_remove(socket: abi::Socket, target: abi::Socket) -> io::Result<
 	socket_map::lock()
 		.get_mut(socket)?
 		.async_socket
-		.get_event()?
+		.as_event_mut()?
 		.remove_socket(target)
 }
 
 #[no_mangle]
 pub fn sys_event_wait(socket: abi::Socket, events: &mut [MaybeUninit<Event>]) -> io::Result<usize> {
-	let (mut async_socket, options) = socket_map::lock().get(socket)?.split_cloned();
-	let async_socket = async_socket.get_event()?;
-	if options.non_blocking {
-		async_socket.fill_events(events)
-	} else {
-		block_on(async_socket.wait_for_events(), options.timeout)?;
-		async_socket.fill_events(events)
-	}
+    let (mut proxy, options) = {
+        let guard = socket_map::lock();
+        let (async_socket, options) = guard
+            .get(socket)?
+            .split_ref();
+        let proxy = async_socket
+            .as_event_proxy(socket)?;
+        (proxy,*options)
+    };
+
+    let event = proxy
+        .with_ref(|async_socket| Ok(
+            async_socket
+                .poll_events()
+                .with(socket,options.into())
+        ))?
+        .execute()?;
+
+    if let Some((head,tail)) = events.split_first_mut() {
+        head.write(event);
+        let count = events
+            .iter_mut()
+            .zip(std::iter::from_fn(move || proxy
+                .with_ref(|async_socket| Ok(async_socket
+                    .poll_events()
+                    .with(socket,options.into())
+                ))
+                .and_then(|mut poll| poll.poll_once())
+                .ok()
+            ))
+            .map(|(m,e)| m.write(e))
+            .count();
+        Ok(count + 1)
+    } else {
+        Ok(0)
+    }
 }
 
 // ---- waker ----
@@ -275,7 +372,7 @@ pub fn sys_waker_send_event(socket: abi::Socket, flags: EventFlags) -> io::Resul
 	socket_map::lock()
 		.get_mut(socket)?
 		.async_socket
-		.get_waker()?
+		.as_waker_mut()?
 		.send_event(flags);
 	run_executor();
 	Ok(())
@@ -293,82 +390,121 @@ pub fn sys_tcp_bind(socket: abi::Socket, local: abi::SocketAddr) -> io::Result<(
 		} else {
 			Err(io::Error::new(
 				io::ErrorKind::AddrNotAvailable,
-				"specified address not available",
+				&"specified address not available",
 			))
 		}
 	})?;
-	socket_map::lock().bind_socket(socket, AsyncTcpSocket::new(None, handle, local).into())?;
+	socket_map::lock()
+        .bind_socket(socket, AsyncTcpSocket::new(local).into())?;
 	run_executor();
 	Ok(())
 }
 
+#[no_mangle]
+pub fn sys_tcp_set_hop_limit(socket: abi::Socket, hop_limit: Option<u8>) -> io::Result<()> {
+	socket_map::lock()
+        .get_mut(socket)?
+        .split_mut().0
+        .as_tcp_mut()?
+	    .set_hop_limit(hop_limit)
+}
+
+#[no_mangle]
+pub fn sys_tcp_hop_limit(socket: abi::Socket) -> io::Result<Option<u8>> {
+	socket_map::lock()
+        .get(socket)?
+        .split_ref().0
+        .as_tcp_ref()?
+	    .hop_limit()
+}
+
+#[no_mangle]
+pub fn sys_tcp_local_addr(socket: abi::Socket) -> io::Result<abi::SocketAddr> {
+	let ip_endpoint = socket_map::lock()
+        .get(socket)?
+        .split_ref().0
+        .as_tcp_ref()?
+	    .local_addr();
+    Ok(smol_to_abi!(ip_endpoint => SocketAddr))
+}
+
+#[no_mangle]
+pub fn sys_tcp_remote_addr(socket: abi::Socket) -> io::Result<abi::SocketAddr> {
+	let ip_endpoint = socket_map::lock()
+        .get(socket)?
+        .split_ref().0
+        .as_tcp_ref()?
+	    .remote_addr()?;
+    Ok(smol_to_abi!(ip_endpoint => SocketAddr))
+}
+
 /// make a socket listen for a connections
-///
-/// NOTE: this does currently not queue connections if multiple arrive therefore
-///       any futher connection attempts after the first will be reset
-///       ToDo: make this work please
 #[no_mangle]
 pub fn sys_tcp_listen(socket: abi::Socket, backlog: usize) -> io::Result<()> {
-    debug!("binding tcp backlog");
-	let async_socket = socket_map::lock().get_mut(socket)?.async_socket.get_tcp()?.clone();
-	socket_map::lock().bind_socket(socket, 
-        socket::AsyncTcpBacklog::listen_on(async_socket,backlog)?.into())?;
-	run_executor();
+	socket_map::lock()
+        .get_mut(socket)?
+        .split_mut().0
+        .as_tcp_mut()?
+	    .listen(backlog)?;
+    run_executor();
     Ok(())
 }
 
 #[no_mangle]
 pub fn sys_tcp_accept(socket: abi::Socket) -> io::Result<abi::Socket> {
-	run_executor();
-	let (mut async_socket, options) = socket_map::lock().get(socket)?.split_cloned();
-	let async_socket = async_socket.get_tcp_backlog()?;
-	if !options.non_blocking {
-		block_on(async_socket.wait_for_incoming_connection(), options.timeout)?;
-        trace!("accepting connection");
-	}
-    let socket = async_socket.accept()?;
-    run_executor();
-    Ok(socket)
+	let (mut proxy,options) = {
+        let guard = socket_map::lock();
+        let (async_socket,options) = guard
+                .get(socket)?
+                .split_ref();
+        let proxy = async_socket
+            .as_tcp_proxy(socket)?;
+        (proxy,*options)
+    };
+
+    loop {
+        proxy
+            .with_ref(|async_socket| Ok(
+                async_socket
+                    .poll_incoming_connection()?
+                    .with(socket,options.into())
+            ))?
+	        .execute()?;
+        match proxy.with_mut(|async_socket| async_socket.accept())? {
+            Some(async_socket) => break {
+                let mut guard = socket_map::lock();
+                let socket = guard.new_socket(options);
+                guard.bind_socket(socket,async_socket.into());
+                Ok(socket)
+            },
+            None => continue,
+        }
+    }
 }
 
 #[no_mangle]
 pub fn sys_tcp_connect(socket: abi::Socket, remote: abi::SocketAddr) -> io::Result<()> {
-	run_executor();
-	let (mut async_socket, options) = socket_map::lock().get(socket)?.split_cloned();
-	let async_socket = async_socket.get_tcp()?;
-	let remote = abi_to_smol!(remote => IpEndpoint);
+	let poll_connected = {
+        let mut guard = socket_map::lock();
+        let (async_socket,options) = guard
+                .get_mut(socket)?
+                .split_mut();
+        let poll_connected = async_socket
+            .as_tcp_mut()?
+            .connect(abi_to_smol!(remote => IpEndpoint))?
+            .with(socket,(*options).into());
+        poll_connected
+    };
 
-	if options.non_blocking {
-		if !async_socket.is_open() {
-			let mut async_socket = async_socket.clone();
-			debug!(
-				"connecting {local} to {remote}",
-				local = async_socket.local,
-				remote = remote
-			);
-			async_socket.connect(remote)
-		} else {
-			async_socket.connect(remote)
-		}
-	} else {
-		debug!(
-			"connecting {local} to {remote}",
-			local = async_socket.local,
-			remote = remote
-		);
-        // ignore first result since it would probably be WouldBlock
-		let _ = async_socket.connect(remote);
-		debug!("wait for connection");
-		block_on(async_socket.wait_for_connection(), None)?;
-		async_socket.connect(remote)
-	}
+    poll_connected.execute()
 }
 
 #[no_mangle]
 pub fn sys_tcp_shutdown(socket: abi::Socket, mode: abi::Shutdown) -> io::Result<()> {
 	run_executor();
-	let (mut async_socket, options) = socket_map::lock().get(socket)?.split_cloned();
-	let async_socket = async_socket.get_tcp()?;
+    let mut guard = socket_map::lock();
+    let (async_socket,_) = guard.get_mut(socket)?.split_mut();
+    let async_socket = async_socket.as_tcp_mut()?;
 	match mode {
 		abi::Shutdown::Read => {
 			async_socket.rclose();
@@ -377,120 +513,128 @@ pub fn sys_tcp_shutdown(socket: abi::Socket, mode: abi::Shutdown) -> io::Result<
 		}
 		abi::Shutdown::Write => {
 			async_socket.wclose();
-			if !options.non_blocking {
-				block_on(async_socket.wait_for_remaining_packets(), options.timeout)?;
-			}
 			Ok(())
 		}
 		abi::Shutdown::Both => {
 			async_socket.rclose();
 			async_socket.wclose();
-			if !options.non_blocking {
-				block_on(async_socket.wait_for_remaining_packets(), options.timeout)?;
-			}
 			Ok(())
 		}
 	}
 }
 
 #[no_mangle]
-pub fn sys_tcp_read(socket: abi::Socket, buf: &mut [u8]) -> io::Result<usize> {
-	run_executor();
-	let (mut async_socket, options) = socket_map::lock().get(socket)?.split_cloned();
-	let async_socket = async_socket.get_tcp()?;
+pub fn sys_tcp_write(socket: abi::Socket, buf: &[u8]) -> Result<usize, io::Error> {
+	let (mut proxy,options) = {
+        let guard = socket_map::lock();
+        let (async_socket,options) = guard
+                .get(socket)?
+                .split_ref();
+        let proxy = async_socket
+            .as_tcp_proxy(socket)?;
+        (proxy,*options)
+    };
 
-	if !options.non_blocking {
-		block_on(async_socket.wait_for_readable(), options.timeout)?;
-	}
-	let n = async_socket.read(buf)?;
-    run_executor();
-    Ok(n)
+    loop {
+        proxy
+            .with_ref(|async_socket| Ok(async_socket
+                .poll_writable()?
+                .with(socket,options.into())
+            ))?
+            .execute()?;
+        match proxy.with_mut(|async_socket| async_socket.write(buf))? {
+            Some(n) => break Ok(n),
+            None => continue,
+        }
+    }
 }
 
 #[no_mangle]
-pub fn sys_tcp_write(socket: abi::Socket, buf: &[u8]) -> Result<usize, io::Error> {
-	run_executor();
-	let (mut async_socket, options) = socket_map::lock().get(socket)?.split_cloned();
-	let async_socket = async_socket.get_tcp()?;
+pub fn sys_tcp_read(socket: abi::Socket, buf: &mut [u8]) -> io::Result<usize> {
+	let (mut proxy,options) = {
+        let guard = socket_map::lock();
+        let (async_socket,options) = guard
+                .get(socket)?
+                .split_ref();
+        let proxy = async_socket
+            .as_tcp_proxy(socket)?;
+        (proxy,*options)
+    };
 
-	if !options.non_blocking {
-		block_on(async_socket.wait_for_writeable(), options.timeout)?;
-	}
+    loop {
+        proxy
+            .with_ref(|async_socket| Ok(async_socket
+                .poll_readable()?
+                .with(socket,options.into())
+            ))?
+            .execute()?;
+        match proxy.with_mut(|async_socket| async_socket.read(buf,false))? {
+            Some(n) => break Ok(n),
+            None => continue,
+        }
+    }
+}
 
-	let n = async_socket.write(buf)?;
-    run_executor();
-    Ok(n)
+#[no_mangle]
+pub fn sys_tcp_peek(socket: abi::Socket, buf: &mut [u8]) -> io::Result<usize> {
+	let (mut proxy,options) = {
+        let guard = socket_map::lock();
+        let (async_socket,options) = guard
+                .get(socket)?
+                .split_ref();
+        let proxy = async_socket
+            .as_tcp_proxy(socket)?;
+        (proxy,*options)
+    };
+
+    loop {
+        proxy
+            .with_ref(|async_socket| Ok(async_socket
+                .poll_readable()?
+                .with(socket,options.into())
+            ))?
+            .execute()?;
+        match proxy.with_mut(|async_socket| 
+            async_socket.read(buf,true))? 
+        {
+            Some(n) => break Ok(n),
+            None => continue,
+        }
+    }
 }
 
 ///////////////////////////////////////////////////////////////////
-// old interface
+// deprecated interface
 ///////////////////////////////////////////////////////////////////
 
 #[no_mangle]
 pub fn sys_tcp_stream_connect(
-	ip_slice: &[u8],
-	port: u16,
-	timeout: Option<u64>,
+	_ip_slice: &[u8],
+	_port: u16,
+	_timeout: Option<u64>,
 ) -> Result<smol::SocketHandle, ()> {
-	let handle = nic::lock().with(|nic| nic.create_tcp_handle());
-	let ip_str = std::str::from_utf8(ip_slice).map_err(|_| ())?;
-	let ip_address = smol::IpAddress::from_str(ip_str).map_err(|_| ())?;
-	let mut async_socket = AsyncTcpSocket::from(handle);
-	async_socket.local = local_endpoint().into();
-
-	let result = async_socket.connect((ip_address, port).into());
-	if result.is_err() && result.unwrap_err().kind == io::ErrorKind::WouldBlock {
-		// block on connect
-		block_on(
-			async_socket.wait_for_connection(),
-			timeout.map(|ms| smol::Duration::from_millis(ms)),
-		)
-		.map_err(|_| {
-			debug!("timeout");
-			()
-		})
-		.map(|_| handle)?;
-		// check for success
-		async_socket.connect((ip_address, port).into())
-	} else {
-		result
-	}
-	.map(|_| handle)
-	.map_err(|_| ())
+    Err(())
 }
 
 #[no_mangle]
-pub fn sys_tcp_stream_read(handle: smol::SocketHandle, buffer: &mut [u8]) -> Result<usize, ()> {
-	let mut socket = AsyncTcpSocket::from(handle);
-	block_on(socket.wait_for_readable(), None).map_err(|_| ())?;
-	let n = socket.read(buffer).map_err(|_| ())?;
-	run_executor();
-	Ok(n)
+pub fn sys_tcp_stream_read(_handle: smol::SocketHandle, _buffer: &mut [u8]) -> Result<usize, ()> {
+    Err(())
 }
 
 #[no_mangle]
 pub fn sys_tcp_stream_write(handle: smol::SocketHandle, buffer: &[u8]) -> Result<usize, ()> {
-	let mut socket = AsyncTcpSocket::from(handle);
-	block_on(socket.wait_for_writeable(), None).map_err(|_| ())?;
-	let n = socket.write(buffer).map_err(|_| ())?;
-	run_executor();
-	Ok(n)
+    Err(())
 }
 
 #[no_mangle]
 pub fn sys_tcp_stream_close(handle: smol::SocketHandle) -> Result<(), ()> {
-	let mut socket = AsyncTcpSocket::from(handle);
-	socket.close();
-	block_on(socket.wait_for_closed(), None).map_err(|_| ())?;
-	nic::lock().with(|nic| nic.socket_set.release(handle));
-	Ok(())
+    Err(())
 }
 
 //ToDo: an enum, or at least constants would be better
 #[no_mangle]
 pub fn sys_tcp_stream_shutdown(handle: smol::SocketHandle, how: i32) -> Result<(), ()> {
-	trace!("ignore shutdown");
-	Ok(())
+    Err(())
 }
 
 #[no_mangle]
@@ -547,31 +691,12 @@ pub fn sys_tcp_stream_get_tll(_handle: smol::SocketHandle) -> Result<u32, ()> {
 
 #[no_mangle]
 pub fn sys_tcp_stream_peer_addr(handle: smol::SocketHandle) -> Result<(smol::IpAddress, u16), ()> {
-	let endpoint = nic::lock().with(|nic| {
-		nic.socket_set
-			.get::<smol::TcpSocket>(handle)
-			.remote_endpoint()
-	});
-
-	Ok((endpoint.addr, endpoint.port))
+    Err(())
 }
 
 #[no_mangle]
 pub fn sys_tcp_listener_accept(
 	port: u16,
 ) -> Result<(smol::SocketHandle, smol::IpAddress, u16), ()> {
-	let handle = nic::lock().with(|nic| nic.create_tcp_handle());
-	let mut async_socket = AsyncTcpSocket::from(handle);
-	async_socket.local = port.into();
-	async_socket.listen().map_err(|_| ())?;
-	run_executor();
-	block_on(async_socket.wait_for_incoming_connection(), None).map_err(|_| {
-		trace!("block time out");
-		()
-	})?;
-	trace!("got an incoming connection on tcp_listener_accept");
-	let remote = async_socket.accept().map_err(|_| ())?;
-	trace!("remote is {:?}", remote);
-
-	Ok((handle, remote.addr, remote.port))
+    Err(())
 }

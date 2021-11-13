@@ -1,67 +1,62 @@
-use crate::net::socket_map;
+use crate::net::{socket_map,poll};
 use futures_lite::future;
 use hermit_abi::io;
 use hermit_abi::net::event::{Event, EventFlags};
-use hermit_abi::net::Socket;
+use hermit_abi::net;
 use std::mem::MaybeUninit;
 use std::task::{Poll, Waker};
 
 #[derive(Debug, Clone)]
 pub(crate) struct AsyncEventSocket {
 	events: Vec<Event>,
-	socket: Option<Socket>,
 }
 
-impl AsyncEventSocket {
-	pub(crate) fn new(socket: Option<Socket>) -> Self {
-		Self {
-			events: Vec::new(),
-			socket,
-		}
-	}
+impl super::Socket for AsyncEventSocket {
+	fn register_send_waker(&mut self, waker: &Waker) -> Option<(Vec<net::Socket>,Vec<net::Socket>)> {
+        None
+    }
 
-	pub(crate) fn set_socket(&mut self, socket: Socket) {
-		let _ = self.socket.insert(socket);
-	}
-
-	pub(crate) fn register_exclusive_recv_waker(&mut self, waker: &Waker) {
-		let mut guard = socket_map::lock();
+	fn register_recv_waker(&mut self, waker: &Waker) -> Option<(Vec<net::Socket>,Vec<net::Socket>)> {
+        let mut send = Vec::new();
+        let mut recv = Vec::new();
 		for Event { socket, flags, .. } in self.events.iter() {
-			let _ = guard.get_mut(*socket).map(|entry| {
-				if flags.0 & (EventFlags::READABLE | EventFlags::RCLOSED) != EventFlags::NONE {
-					entry.register_recv_waker(waker);
-				}
-				if flags.0 & (EventFlags::WRITABLE | EventFlags::WCLOSED) != EventFlags::NONE {
-					entry.register_send_waker(waker);
-				}
-			});
-		}
+            if flags.0 & (EventFlags::WRITABLE | EventFlags::WCLOSED) != EventFlags::NONE {
+                send.push(*socket);
+            }
+            if flags.0 & (EventFlags::READABLE | EventFlags::RCLOSED) != EventFlags::NONE {
+                recv.push(*socket);
+            }
+		};
+        Some((send,recv))
 	}
 
-	pub(crate) fn get_event_flags(&self) -> EventFlags {
+	fn get_event_flags(&mut self) -> EventFlags {
 		self.events
 			.iter()
 			.any(|Event { socket, flags, .. }| {
 				socket_map::lock()
-					.get(*socket)
-					.map(|entry| {
-						entry.async_socket.get_event_flags().0 & flags.0 != EventFlags::NONE
-					})
+					.get_mut(*socket)
+					.and_then(|entry|
+						entry.async_socket.as_socket_mut())
+                    .map(|socket| 
+                        socket.get_event_flags().0 & flags.0 != EventFlags::NONE)
 					.unwrap_or(false)
 			})
 			.then(|| EventFlags(EventFlags::READABLE))
 			.unwrap_or(EventFlags(EventFlags::NONE))
 	}
 
+    fn close(&mut self) {}
+}
+
+impl AsyncEventSocket {
+	pub(crate) fn new() -> Self {
+		Self {
+			events: Vec::new(),
+		}
+	}
+
 	pub(crate) fn add_event(&mut self, event: Event) -> io::Result<()> {
-		assert!(
-			!self
-				.socket
-				.as_ref()
-				.map(|&socket| socket == event.socket)
-				.unwrap_or(false),
-			"can't add an event socket to itself"
-		);
 		self.events
 			.iter()
 			.find(|e| e.socket == event.socket)
@@ -69,7 +64,7 @@ impl AsyncEventSocket {
 			.then(|| self.events.push(event))
 			.ok_or(io::Error::new(
 				io::ErrorKind::AlreadyExists,
-				"an event for the specified socket already exists",
+				&"an event for the specified socket already exists",
 			))
 	}
 
@@ -80,11 +75,11 @@ impl AsyncEventSocket {
 			.map(|e| *e = event)
 			.ok_or(io::Error::new(
 				io::ErrorKind::NotFound,
-				"this socket is not part of the specified event socket",
+				&"this socket is not part of the specified event socket",
 			))
 	}
 
-	pub(crate) fn remove_socket(&mut self, socket: Socket) -> io::Result<()> {
+	pub(crate) fn remove_socket(&mut self, socket: net::Socket) -> io::Result<()> {
 		self.events
 			.iter()
 			.enumerate()
@@ -93,56 +88,42 @@ impl AsyncEventSocket {
 			.map(|_| ())
 			.ok_or(io::Error::new(
 				io::ErrorKind::NotFound,
-				"this socket is not part of the specified event socket",
+				&"this socket is not part of the specified event socket",
 			))
 	}
 
-	pub(crate) fn fill_events(&self, events: &mut [MaybeUninit<Event>]) -> io::Result<usize> {
-		let mut iter = events.iter_mut();
-		Ok(self
-			.events
-			.iter()
-			.map(|event @ Event { socket, flags, .. }| {
-				socket_map::lock()
-					.get(*socket)
-					.ok()
-					.and_then(|entry| {
-						let matching_events = entry.async_socket.get_event_flags().0 & flags.0;
-						if matching_events != EventFlags::NONE {
-							iter.next().map(|e| {
-								e.write(Event {
-									flags: EventFlags(matching_events),
-									..*event
-								});
-								1
-							})
-						} else {
-							None
-						}
-					})
-					.unwrap_or(0)
-			})
-			.sum())
-	}
-
-	pub(crate) async fn wait_for_events(&self) {
-		future::poll_fn(|cx| {
-			if let Some(socket) = self.socket {
-				if self.get_event_flags().0 & EventFlags::READABLE != EventFlags::NONE {
-					Poll::Ready(())
-				} else {
-					socket_map::lock()
-						.get_mut(socket)
-						.map(|entry| {
-							entry.register_recv_waker(cx.waker());
-							Poll::Pending
-						})
-						.unwrap_or(Poll::Ready(()))
-				}
-			} else {
-				Poll::Ready(())
-			}
-		})
-		.await
+	pub(crate) fn poll_events(&self) 
+        -> poll::PollEventsRaw<impl FnMut(&Event) -> poll::Poll<io::Result<Event>>>
+    {
+        poll::PollEventsRaw::new(self.events.clone(), move |event| {
+            socket_map::lock()
+                .get_mut(event.socket)
+                .and_then(|entry| {
+                    let flags = entry.async_socket
+                        .as_socket_mut()?
+                        .get_event_flags();
+                    let matching_flags = flags.0 & event.flags.0;
+                    if matching_flags != EventFlags::NONE {
+                        Ok(poll::Poll::Ready(Ok(Event { flags: EventFlags(matching_flags), ..*event })))
+                    } else {
+                        match event.flags.0 {
+                            f if f & (EventFlags::READABLE | EventFlags::RCLOSED) != 0 =>
+                                Ok(poll::Poll::Pending(poll::WakeOn::Recv)),
+                            f if f & (EventFlags::WRITABLE | EventFlags::WCLOSED) != 0 =>
+                                Ok(poll::Poll::Pending(poll::WakeOn::Send)),
+                            _ => unreachable!(),
+                        }
+                    }
+                })
+                .unwrap_or_else(|_err| {
+                        match event.flags.0 {
+                            f if f & (EventFlags::READABLE | EventFlags::RCLOSED) != 0 =>
+                                poll::Poll::Ready(Ok(Event { flags: EventFlags(EventFlags::RCLOSED), .. *event })),
+                            f if f & (EventFlags::WRITABLE | EventFlags::WCLOSED) != 0 =>
+                                poll::Poll::Ready(Ok(Event { flags: EventFlags(EventFlags::WCLOSED), .. *event })),
+                            _ => unreachable!(),
+                        }
+                })
+        })
 	}
 }

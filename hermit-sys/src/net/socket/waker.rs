@@ -1,53 +1,48 @@
 use hermit_abi::net::event::EventFlags;
-use hermit_abi::net::Socket;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use hermit_abi::net;
 use std::task::Waker;
+use crate::net::waker::WakerRegistration;
 
 #[derive(Debug, Clone)]
 pub(crate) struct AsyncWakerSocket {
-	socket: Option<Socket>,
-	event_flags: Arc<AtomicU32>,
-	send_waker: Option<Waker>,
-	recv_waker: Option<Waker>,
+	event_flags: u32,
+	send_waker: WakerRegistration,
+	recv_waker: WakerRegistration,
+}
+
+impl super::Socket for AsyncWakerSocket {
+	fn register_send_waker(&mut self, waker: &Waker) -> Option<(Vec<net::Socket>,Vec<net::Socket>)> {
+		self.send_waker.register(waker);
+        None
+	}
+
+	fn register_recv_waker(&mut self, waker: &Waker) -> Option<(Vec<net::Socket>,Vec<net::Socket>)> {
+		self.recv_waker.register(waker);
+        None
+	}
+
+	fn get_event_flags(&mut self) -> EventFlags {
+		EventFlags(std::mem::replace(&mut self.event_flags,EventFlags::NONE))
+	}
+
+    fn close(&mut self) {}
 }
 
 impl AsyncWakerSocket {
-	pub(crate) fn new(socket: Option<Socket>) -> Self {
+	pub(crate) fn new(socket: Option<net::Socket>) -> Self {
 		Self {
-			socket,
-			send_waker: None,
-			recv_waker: None,
-			event_flags: Arc::new(AtomicU32::new(EventFlags::NONE)),
+			send_waker: WakerRegistration::new(),
+			recv_waker: WakerRegistration::new(),
+			event_flags: EventFlags::NONE,
 		}
-	}
-
-	pub(crate) fn set_socket(&mut self, socket: Socket) {
-		let _ = self.socket.insert(socket);
-	}
-
-	pub(crate) fn register_exclusive_send_waker(&mut self, waker: &Waker) {
-		let _ = self.send_waker.insert(waker.clone());
-	}
-
-	pub(crate) fn register_exclusive_recv_waker(&mut self, waker: &Waker) {
-		let _ = self.recv_waker.insert(waker.clone());
-	}
-
-	pub(crate) fn get_event_flags(&self) -> EventFlags {
-		EventFlags(self.event_flags.swap(EventFlags::NONE, Ordering::SeqCst))
 	}
 
 	fn wake_send(&mut self) {
-		if let Some(waker) = self.send_waker.take() {
-			waker.wake();
-		}
+		self.send_waker.wake();
 	}
 
 	fn wake_recv(&mut self) {
-		if let Some(waker) = self.recv_waker.take() {
-			waker.wake();
-		}
+		self.recv_waker.wake();
 	}
 
 	pub(crate) fn close(&mut self) {
@@ -62,6 +57,6 @@ impl AsyncWakerSocket {
 		if event_flags.0 & (EventFlags::RCLOSED | EventFlags::READABLE) != EventFlags::NONE {
 			self.wake_recv();
 		}
-		self.event_flags.store(event_flags.0, Ordering::SeqCst);
+		self.event_flags = event_flags.0;
 	}
 }

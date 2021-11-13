@@ -162,7 +162,7 @@ where
 							}
 							return Err(io::Error::new(
 								io::ErrorKind::TimedOut,
-								"executor timed out",
+								&"executor timed out",
 							));
 						}
 					}
@@ -198,7 +198,7 @@ where
 						if Instant::now() >= start + duration {
 							return Err(io::Error::new(
 								io::ErrorKind::TimedOut,
-								"executor timed out",
+								&"executor timed out",
 							));
 						}
 					}

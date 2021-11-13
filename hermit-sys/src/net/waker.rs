@@ -2,7 +2,7 @@
 use core::task::Waker;
 
 /// Utility struct to register and wake a waker.
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub(crate) struct WakerRegistration {
 	waker: Option<Waker>,
 }
