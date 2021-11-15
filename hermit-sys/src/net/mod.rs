@@ -260,8 +260,10 @@ impl AsyncSocket {
 				| TcpState::Closing
 				| TcpState::TimeWait => Poll::Ready(Err(Error::Illegal)),
 				_ => {
-					if s.may_recv() {
+					if s.can_recv(){
 						Poll::Ready(s.recv_slice(buffer))
+					} else if !s.may_recv(){
+						Poll::Ready(Ok(0))
 					} else {
 						s.register_recv_waker(cx.waker());
 						Poll::Pending
@@ -427,6 +429,7 @@ pub fn sys_tcp_stream_read(handle: Handle, buffer: &mut [u8]) -> Result<usize, (
 #[no_mangle]
 pub fn sys_tcp_stream_write(handle: Handle, buffer: &[u8]) -> Result<usize, ()> {
 	let socket = AsyncSocket::from(handle);
+	debug!("sys_tcp_stream_write");
 	poll_on(socket.write(buffer), None)?.map_err(|_| ())
 }
 
