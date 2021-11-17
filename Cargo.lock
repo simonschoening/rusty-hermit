@@ -468,7 +468,6 @@ dependencies = [
  "aarch64",
  "hermit-sys",
  "rayon",
- "riscv",
  "syscalls",
 ]
 
@@ -809,7 +808,6 @@ dependencies = [
  "hermit-sys",
  "num_cpus",
  "rayon",
- "syscalls",
 ]
 
 [[package]]

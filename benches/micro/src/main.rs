@@ -2,11 +2,12 @@
 #![allow(unused_imports)]
 #![feature(test)]
 #![feature(bench_black_box)]
+#![feature(asm)]
 
 #[cfg(target_os = "hermit")]
 extern crate hermit_sys;
 extern crate rayon;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_arch = "riscv64")))]
 #[macro_use]
 extern crate syscalls;
 

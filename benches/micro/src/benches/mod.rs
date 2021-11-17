@@ -1,7 +1,5 @@
 #[cfg(target_arch = "aarch64")]
 use aarch64::regs::*;
-#[cfg(target_arch = "riscv64")]
-use riscv::register::time;
 use std::env;
 use std::f64::consts::{E, PI};
 use std::ffi::c_void;
@@ -14,8 +12,10 @@ use std::str;
 use std::thread;
 use std::time::Instant;
 use std::vec;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_arch = "riscv64")))]
 use syscalls::SYS_getpid;
+#[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+const SYS_GETPID: u64 = 172;
 
 extern "C" {
 	pub fn memcpy(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
@@ -44,7 +44,14 @@ fn get_timestamp() -> u64 {
 #[cfg(target_arch = "riscv64")]
 #[inline]
 fn get_timestamp() -> u64 {
-	time::read64()
+	let time: u64;
+	unsafe{
+		asm!(
+			"rdcycle {time}",
+			time = out(reg) time
+		);
+	}
+	time
 }
 
 extern "C" {
@@ -59,16 +66,26 @@ pub fn bench_syscall() -> Result<(), ()> {
 		// cache warmup
 		#[cfg(target_os = "hermit")]
 		let _ = sys_getpid();
-		#[cfg(target_os = "linux")]
+		#[cfg(all(target_os = "linux", not(target_arch = "riscv64")))]
 		let _ = syscall!(SYS_getpid);
+		#[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+		asm!(
+			"ecall",
+			in("a7") SYS_GETPID
+		);
 		let _ = get_timestamp();
 
 		let start = get_timestamp();
 		for _ in 0..n {
 			#[cfg(target_os = "hermit")]
 			let _ = sys_getpid();
-			#[cfg(target_os = "linux")]
+			#[cfg(all(target_os = "linux", not(target_arch = "riscv64")))]
 			let _ = syscall!(SYS_getpid);
+			#[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+			asm!(
+				"ecall",
+				in("a7") SYS_GETPID
+			);
 		}
 		get_timestamp() - start
 	};
