@@ -45,7 +45,7 @@ fn get_timestamp() -> u64 {
 #[inline]
 fn get_timestamp() -> u64 {
 	let time: u64;
-	unsafe{
+	unsafe {
 		asm!(
 			"rdcycle {time}",
 			time = out(reg) time
