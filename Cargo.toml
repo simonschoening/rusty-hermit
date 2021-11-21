@@ -7,9 +7,9 @@ members = [
     "examples/hello_world",
     "examples/httpd",
     "examples/demo",
-#    "examples/mio",
     "examples/tcp_echo",
     "examples/tcp_server",
+    "examples/mio_tcp_server",
 ]
 exclude = ["target", "loader", "libhermit-rs"]
 

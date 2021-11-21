@@ -2,6 +2,8 @@ use abi::net::event::*;
 use abi::net::*;
 use core::mem::MaybeUninit;
 use hermit_abi as abi;
+use std::io::Write;
+use std::net::TcpStream;
 
 #[allow(unused_imports)]
 extern crate hermit_sys;
@@ -9,6 +11,10 @@ extern crate hermit_sys;
 const NUM_SOCKETS: usize = 8;
 
 fn main() {
+	let mut stream = TcpStream::connect("10.0.5.1:5042").unwrap();
+	stream.write(b"Hello from Rusty Hermit").unwrap();
+	drop(stream);
+
 	for num in 1.. {
 		let event_socket = socket().unwrap();
 		event_bind(event_socket).unwrap();
@@ -17,7 +23,7 @@ fn main() {
 		let mut sockets = Vec::new();
 		for i in 0..NUM_SOCKETS {
 			let socket = socket().unwrap();
-			socket_set_non_blocking(socket, true).unwrap();
+			//socket_set_non_blocking(socket, true).unwrap();
 			tcp_bind(
 				socket,
 				SocketAddr::V4(SocketAddrV4 {
@@ -136,14 +142,13 @@ fn main() {
 
 			print!("closing socket...");
 			//tcp_shutdown(sock,Shutdown::Both).unwrap();
+			event_remove(event_socket, sock).unwrap();
 			socket_close(sock).unwrap();
 			println!("done");
 		}
 
-        socket_close(event_socket).unwrap();
+		socket_close(event_socket).unwrap();
 
-		unsafe {
-			abi::usleep(100_000);
-		}
+		//unsafe { abi::usleep(1_000_000); }
 	}
 }

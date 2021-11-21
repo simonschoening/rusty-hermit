@@ -1,6 +1,6 @@
 use crate::net::device::HermitNet;
-use crate::net::waker::WakerRegistration;
 use crate::net::socket::HandleWrapper;
+use crate::net::waker::WakerRegistration;
 use concurrent_queue::ConcurrentQueue;
 #[cfg(feature = "dhcpv4")]
 use smoltcp::dhcp::Dhcpv4Client;
@@ -14,7 +14,6 @@ use std::task::{Context, Waker};
 
 lazy_static! {
 	static ref NIC: Mutex<NetworkState> = Mutex::new(NetworkState::Missing);
-	static ref WAKER: ConcurrentQueue<Waker> = ConcurrentQueue::unbounded();
 }
 
 /// lock the global NetworkState
@@ -22,18 +21,6 @@ lazy_static! {
 /// This will panic if the network mutex is poisoned
 pub(crate) fn lock() -> MutexGuard<'static, NetworkState> {
 	NIC.lock().expect("Network State poisoned")
-}
-
-pub(crate) fn register_waker(waker: &Waker) {
-	WAKER.push(waker.clone()).unwrap();
-}
-
-fn wake_any() {
-	// wake any future waiting on socket changes on which smoltcp does not report by itself
-	while let Ok(waker) = WAKER.pop() {
-		trace!("waking a 'WakeOn::Any' future");
-		waker.wake();
-	}
 }
 
 pub(crate) enum NetworkState {
@@ -64,14 +51,18 @@ pub(crate) struct NetworkInterface<T: for<'a> Device<'a>> {
 	pub dhcp: Dhcpv4Client,
 	#[cfg(feature = "dhcpv4")]
 	pub prev_cidr: Ipv4Cidr,
-	pub waker: WakerRegistration,
+	pub woken: bool,
 }
 
 impl<T> NetworkInterface<T>
 where
 	T: for<'a> Device<'a>,
 {
-	pub(crate) fn with_ref<S: AnySocket<'static>, F, R>(&mut self, handle: &HandleWrapper, f: F) -> R
+	pub(crate) fn with_ref<S: AnySocket<'static>, F, R>(
+		&mut self,
+		handle: &HandleWrapper,
+		f: F,
+	) -> R
 	where
 		F: FnOnce(&S) -> R,
 	{
@@ -79,7 +70,11 @@ where
 		f(&*socket)
 	}
 
-	pub(crate) fn with_mut<S: AnySocket<'static>, F, R>(&mut self, handle: &HandleWrapper, f: F) -> R
+	pub(crate) fn with_mut<S: AnySocket<'static>, F, R>(
+		&mut self,
+		handle: &HandleWrapper,
+		f: F,
+	) -> R
 	where
 		F: FnOnce(&mut S) -> R,
 	{
@@ -91,22 +86,26 @@ where
 		let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; 65535]);
 		let tcp_tx_buffer = TcpSocketBuffer::new(vec![0; 65535]);
 		let tcp_socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
-        trace!("creating tcp handle");
+		trace!("creating tcp handle");
 		let handle = self.socket_set.add(tcp_socket);
-        HandleWrapper::new(handle)
+		HandleWrapper::new(handle)
 	}
 
 	pub(crate) fn wake(&mut self) {
 		// wake the network future
-		debug!(
-			"nic has {} sockets in socket_set",
+		trace!(
+			"waking nic with {} sockets in socket_set",
 			self.socket_set.iter().count()
 		);
-		self.waker.wake();
-		wake_any();
+		self.woken = true;
 	}
 
-	fn poll_common(&mut self, timestamp: smoltcp::time::Instant) {
+	pub(crate) fn was_woken(&self) -> bool {
+		self.woken
+	}
+
+	pub fn poll(&mut self, timestamp: smoltcp::time::Instant) {
+		self.woken = false;
 		while self
 			.iface
 			.poll(&mut self.socket_set, timestamp.into())
@@ -158,11 +157,6 @@ where
 				}
 			}
 		});
-	}
-
-	pub(crate) fn poll(&mut self, cx: &mut Context<'_>, timestamp: smoltcp::time::Instant) {
-		self.waker.register(cx.waker());
-		self.poll_common(timestamp);
 	}
 
 	pub(crate) fn poll_delay(

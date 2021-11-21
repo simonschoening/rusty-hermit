@@ -103,7 +103,7 @@ impl NetworkInterface<HermitNet> {
 			socket_set,
 			dhcp,
 			prev_cidr,
-			waker: WakerRegistration::new(),
+			woken: true,
 		})
 	}
 
@@ -175,7 +175,7 @@ impl NetworkInterface<HermitNet> {
 		NetworkState::Initialized(Self {
 			iface,
 			socket_set: SocketSet::new(vec![]),
-			waker: WakerRegistration::new(),
+			woken: true,
 		})
 	}
 }

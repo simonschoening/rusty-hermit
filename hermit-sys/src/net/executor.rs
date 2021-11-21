@@ -1,11 +1,11 @@
 /// An executor, which is run when idling on network I/O.
-use crate::net::network_delay;
 use crate::net::nic;
 use async_task::{Runnable, Task};
 use concurrent_queue::ConcurrentQueue;
 use futures_lite::pin;
 use smoltcp::time::{Duration, Instant};
 use std::sync::atomic::Ordering;
+use std::sync::{Mutex, MutexGuard};
 use std::{
 	future::Future,
 	sync::{atomic::AtomicBool, Arc},
@@ -21,45 +21,72 @@ extern "C" {
 	fn sys_getpid() -> Tid;
 	fn sys_yield();
 	fn sys_wakeup_task(tid: Tid);
-	fn sys_set_network_polling_mode(value: bool);
+	fn sys_set_network_polling_mode(polling: bool);
 	fn sys_block_current_task_with_timeout(timeout: u64);
 	fn sys_block_current_task();
 }
 
-lazy_static! {
-	static ref QUEUE: ConcurrentQueue<Runnable> = ConcurrentQueue::unbounded();
-}
+pub(crate) struct PollingMode;
 
-pub(crate) fn run_executor() {
-	unsafe {
+impl PollingMode {
+	pub unsafe fn on(&mut self) {
 		sys_set_network_polling_mode(true);
 	}
-	execute_all();
-	unsafe {
+
+	pub unsafe fn off(&mut self) {
 		sys_set_network_polling_mode(false);
 	}
 }
 
-fn execute_all() {
-	while let Ok(runnable) = QUEUE.pop() {
-		runnable.run();
+lazy_static! {
+	pub(crate) static ref POLLING_MODE: Mutex<PollingMode> = Mutex::new(PollingMode);
+}
+
+pub(crate) struct PollingGuard {
+	polling_mode: MutexGuard<'static, PollingMode>,
+}
+
+impl PollingGuard {
+	pub fn new() -> Self {
+		let mut polling_mode = POLLING_MODE.lock().unwrap();
+		unsafe {
+			polling_mode.on();
+		}
+		Self { polling_mode }
 	}
 }
 
-/// Spawns a future on the executor.
-///
-/// if a future has not registered a waker
-/// and it's task is never polled, it will leak memory
-#[must_use]
-pub fn spawn<F, T>(future: F) -> Task<T>
-where
-	F: Future<Output = T> + Send + 'static,
-	T: Send + 'static,
-{
-	let schedule = |runnable| QUEUE.push(runnable).unwrap();
-	let (runnable, task) = async_task::spawn(future, schedule);
-	runnable.schedule();
-	task
+impl Drop for PollingGuard {
+	fn drop(&mut self) {
+		unsafe { self.polling_mode.off() }
+		execute_all();
+		nic::lock().with(|nic| nic.poll(Instant::now()));
+	}
+}
+
+lazy_static! {
+	pub static ref QUEUE: ConcurrentQueue<Runnable> = ConcurrentQueue::unbounded();
+}
+
+pub(crate) fn run_executor() {
+	trace!("running executor");
+	let polling = PollingGuard::new();
+	execute_all();
+	loop {
+		nic::lock().with(|nic| nic.poll(Instant::now()));
+		execute_all();
+		match nic::lock().with(|nic| nic.was_woken()) {
+			true => continue,
+			false => break,
+		}
+	}
+	drop(polling)
+}
+
+pub(crate) fn execute_all() {
+	while let Ok(runnable) = QUEUE.pop() {
+		runnable.run();
+	}
 }
 
 struct ThreadNotify {
@@ -88,19 +115,9 @@ impl ThreadNotify {
 		self.unparked.swap(false, Ordering::Relaxed)
 	}
 
-	pub fn reset_unparked(&self) {
-		self.unparked.store(false, Ordering::Release);
-	}
-
 	pub fn reset(&self) {
 		self.woken.store(false, Ordering::Relaxed);
 		self.unparked.store(false, Ordering::Release);
-	}
-}
-
-impl Drop for ThreadNotify {
-	fn drop(&mut self) {
-		println!("Dropping ThreadNotify!");
 	}
 }
 
@@ -122,54 +139,24 @@ impl Wake for ThreadNotify {
 	}
 }
 
-thread_local! {
-	static CURRENT_THREAD_NOTIFY: Arc<ThreadNotify> = Arc::new(ThreadNotify::new());
+/// Spawns a future on the executor.
+///
+/// if a future has not registered a waker
+/// and it's task is never polled, it will leak memory
+#[must_use]
+pub fn spawn<F, T>(future: F) -> Task<T>
+where
+	F: Future<Output = T> + Send + 'static,
+	T: Send + 'static,
+{
+	let schedule = |runnable| QUEUE.push(runnable).unwrap();
+	let (runnable, task) = async_task::spawn(future, schedule);
+	runnable.schedule();
+	task
 }
 
-pub fn poll_on<F, T>(future: F, timeout: Option<Duration>) -> io::Result<T>
-where
-	F: Future<Output = T>,
-{
-	CURRENT_THREAD_NOTIFY.with(|thread_notify| {
-		unsafe {
-			sys_set_network_polling_mode(true);
-		}
-
-		let start = Instant::now();
-		let waker = thread_notify.clone().into();
-		let mut cx = Context::from_waker(&waker);
-		pin!(future);
-
-		loop {
-			if let Poll::Ready(t) = future.as_mut().poll(&mut cx) {
-				unsafe {
-					sys_set_network_polling_mode(false);
-				}
-				return Ok(t);
-			} else {
-				while !thread_notify.was_woken() {
-					trace!("polling network");
-					let delay = network_delay(Instant::now()).map(|d| d.total_millis());
-
-					trace!("ignoring advisory delay of {:?}ms", delay);
-
-					execute_all();
-
-					if let Some(duration) = timeout {
-						if Instant::now() >= start + duration {
-							unsafe {
-								sys_set_network_polling_mode(false);
-							}
-							return Err(io::Error::new(
-								io::ErrorKind::TimedOut,
-								&"executor timed out",
-							));
-						}
-					}
-				}
-			}
-		}
-	})
+thread_local! {
+	static CURRENT_THREAD_NOTIFY: Arc<ThreadNotify> = Arc::new(ThreadNotify::new());
 }
 
 /// Blocks the current thread on `f`, running the executor when idling.
@@ -183,13 +170,17 @@ where
 		let waker = thread_notify.clone().into();
 		let mut cx = Context::from_waker(&waker);
 		pin!(future);
+		let mut polling = Some(PollingGuard::new());
 		loop {
 			thread_notify.reset();
+			execute_all();
+			nic::lock().with(|nic| nic.poll(Instant::now()));
 			if let Poll::Ready(t) = future.as_mut().poll(&mut cx) {
 				trace!(
 					"blocking future on thread {} is ready!",
 					thread_notify.thread
 				);
+				drop(polling.take());
 				return Ok(t);
 			} else {
 				while !thread_notify.was_woken() {
@@ -203,32 +194,35 @@ where
 						}
 					}
 
-					run_executor();
-
-					// when to poll the network for progress
+					// run executor before blocking
+					polling.get_or_insert_with(|| PollingGuard::new());
 					trace!("checking network delay");
-					let delay = network_delay(Instant::now()).map(|d| d.total_millis());
-					debug!("delay is {:?}", delay);
+					let delay = nic::lock()
+						.with(|nic| nic.poll_delay(Instant::now()))
+						.map(|d| d.total_millis());
+					execute_all();
+					trace!("delay is {:?}", delay);
 
 					// wait for the advised delay if it's greater than 100ms
-					if !thread_notify.was_woken() && (delay.is_none() || delay.unwrap() > 100) {
-						unsafe {
-							sys_block_current_task_with_timeout(delay.unwrap_or(10000));
-							if thread_notify.swap_unparked() {
-								debug!("not blocking! thread_notify was already unparked");
-								sys_wakeup_task(thread_notify.thread);
+					if !thread_notify.was_woken() && (delay.is_none() || delay.unwrap() > 1000) {
+						drop(polling.take());
+						warn!("blocking task");
+						// deactivate the polling_mode when blocking
+						if !thread_notify.swap_unparked() {
+							unsafe {
+								match delay {
+									Some(d) => sys_block_current_task_with_timeout(d),
+									None => sys_block_current_task(),
+								};
+								sys_yield();
 							}
-							sys_yield();
 						}
 					}
-
-					run_executor();
-
-					// now wake nic so it may poll
-					nic::lock().with(|nic| nic.wake());
+					execute_all();
+					nic::lock().with(|nic| nic.poll(Instant::now()));
 				}
+				trace!("thread_notify was woken!");
 			}
-			trace!("thread_notify was woken!");
 		}
 	})
 }

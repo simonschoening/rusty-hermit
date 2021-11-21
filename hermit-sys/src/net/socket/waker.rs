@@ -1,7 +1,7 @@
-use hermit_abi::net::event::EventFlags;
-use hermit_abi::net;
-use std::task::Waker;
 use crate::net::waker::WakerRegistration;
+use hermit_abi::net;
+use hermit_abi::net::event::EventFlags;
+use std::task::Waker;
 
 #[derive(Debug, Clone)]
 pub(crate) struct AsyncWakerSocket {
@@ -11,21 +11,27 @@ pub(crate) struct AsyncWakerSocket {
 }
 
 impl super::Socket for AsyncWakerSocket {
-	fn register_send_waker(&mut self, waker: &Waker) -> Option<(Vec<net::Socket>,Vec<net::Socket>)> {
+	fn register_exclusive_send_waker(
+		&mut self,
+		waker: &Waker,
+	) -> Option<(Vec<net::Socket>, Vec<net::Socket>)> {
 		self.send_waker.register(waker);
-        None
+		None
 	}
 
-	fn register_recv_waker(&mut self, waker: &Waker) -> Option<(Vec<net::Socket>,Vec<net::Socket>)> {
+	fn register_exclusive_recv_waker(
+		&mut self,
+		waker: &Waker,
+	) -> Option<(Vec<net::Socket>, Vec<net::Socket>)> {
 		self.recv_waker.register(waker);
-        None
+		None
 	}
 
 	fn get_event_flags(&mut self) -> EventFlags {
-		EventFlags(std::mem::replace(&mut self.event_flags,EventFlags::NONE))
+		EventFlags(std::mem::replace(&mut self.event_flags, EventFlags::NONE))
 	}
 
-    fn close(&mut self) {}
+	fn close(&mut self) {}
 }
 
 impl AsyncWakerSocket {

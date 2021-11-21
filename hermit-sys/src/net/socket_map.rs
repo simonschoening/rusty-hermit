@@ -1,13 +1,12 @@
+use crate::net::poll;
+use crate::net::socket::AsyncSocket;
+use crate::net::waker::WakerRegistration;
 use futures_lite::future;
+use hermit_abi::io;
+use hermit_abi::net::Socket;
 use smoltcp::time::Duration;
 use std::sync::{Mutex, MutexGuard};
 use std::task::{Poll, Waker};
-use hermit_abi::io;
-use hermit_abi::net::Socket;
-use crate::net::executor;
-use crate::net::socket::AsyncSocket;
-use crate::net::waker::WakerRegistration;
-use crate::net::poll;
 
 lazy_static! {
 	static ref SOCKETS: Mutex<SocketMap> = Mutex::new(SocketMap::new());
@@ -39,6 +38,8 @@ pub(crate) struct SocketEntry {
 	pub async_socket: AsyncSocket,
 	/// options for callign behaviour of a socket
 	pub options: Options,
+	// whether this entry is closing
+	pub closing: bool,
 	// this task registers it's waker on the socket
 	// and on wake drains and wakes all recv_wakers
 	// it must be woken when the underlying socket changes
@@ -78,10 +79,10 @@ impl SocketEntry {
 		self.recv_wakers.push(waker.clone());
 	}
 
-    pub(crate) fn insert_async_socket(&mut self, async_socket: AsyncSocket) {
-        self.async_socket = async_socket;
-        self.wake_tasks();
-    }
+	pub(crate) fn insert_async_socket(&mut self, async_socket: AsyncSocket) {
+		self.async_socket = async_socket;
+		self.wake_tasks();
+	}
 
 	/// wake the associated tasks to notify them of changes to this socket
 	pub(crate) fn wake_tasks(&mut self) {
@@ -91,6 +92,7 @@ impl SocketEntry {
 
 	/// wake all registered recv wakers
 	fn wake_recv(&mut self) {
+		trace!("waking {} recv wakers", self.send_wakers.len());
 		for waker in self.recv_wakers.drain(..) {
 			waker.wake();
 		}
@@ -98,6 +100,7 @@ impl SocketEntry {
 
 	/// wake all registered recv wakers
 	fn wake_send(&mut self) {
+		trace!("waking {} send wakers", self.send_wakers.len());
 		for waker in self.send_wakers.drain(..) {
 			waker.wake();
 		}
@@ -127,53 +130,66 @@ impl SocketMap {
 		Socket { id }
 	}
 
-    fn register_wake_task_waker(&mut self, socket: Socket, waker: &Waker, wake_on: poll::WakeOn) {
-        let mut send = Vec::new();
-        let mut recv = Vec::new();
-
-        match wake_on {
-            poll::WakeOn::Send => send.push(socket),
-            poll::WakeOn::Recv => recv.push(socket),
-            poll::WakeOn::SendRecv => {
-                send.push(socket);
-                recv.push(socket);
-            },
-        }
-
-        let mut guard = lock();
-
-        loop {
-            if let Some(socket) = send.pop() {
-                guard
-                    .get_mut(socket)
-                    .and_then(|entry| 
-                        entry.async_socket
-                            .as_socket_mut()
-                            .map(|socket| socket.register_send_waker(waker)))
-                    .ok().flatten()
-                    .map(|(s,r)| {
-                        send.extend_from_slice(&s);
-                        recv.extend_from_slice(&r);
-                    })
-                    .unwrap_or(());
-            } else if let Some(socket) = recv.pop() {
-                guard
-                    .get_mut(socket)
-                    .and_then(|entry| 
-                        entry.async_socket
-                            .as_socket_mut()
-                            .map(|socket| socket.register_recv_waker(waker)))
-                    .ok().flatten()
-                    .map(|(s,r)| {
-                        send.extend_from_slice(&s);
-                        recv.extend_from_slice(&r);
-                    })
-                    .unwrap_or(());
-            } else {
-                break;
-            }
-        }
-    }
+	/// register an exclusive waker for the relevant socket and notification wakers on other
+	/// relevant sockets
+	pub fn register_exclusive_waker(
+		&mut self,
+		socket: Socket,
+		waker: &Waker,
+		wake_on: poll::WakeOn,
+	) {
+		self.get_mut(socket)
+			.and_then(|entry| {
+				entry
+					.async_socket
+					.as_socket_mut()
+					.map(|socket| match wake_on {
+						poll::WakeOn::Send => socket.register_exclusive_send_waker(waker),
+						poll::WakeOn::Recv => socket.register_exclusive_recv_waker(waker),
+						poll::WakeOn::SendRecv => {
+							if let Some((mut s1, mut r1)) =
+								socket.register_exclusive_send_waker(waker)
+							{
+								if let Some((s2, r2)) = socket.register_exclusive_recv_waker(waker)
+								{
+									s1.extend_from_slice(&s2);
+									r1.extend_from_slice(&r2);
+									s1.dedup();
+									r1.dedup();
+								}
+								Some((s1, r1))
+							} else {
+								socket.register_exclusive_recv_waker(waker)
+							}
+						}
+					})
+			})
+			.ok()
+			.flatten()
+			.map(|(s, r)| {
+				for send in s {
+					trace!(
+						"register transient send waker for {:?} on {:?}",
+						socket,
+						send
+					);
+					self.get_mut(send)
+						.map(|entry| entry.register_send_waker(waker))
+						.unwrap_or_else(|_| warn!("registering send waker on unknown socket"));
+				}
+				for recv in r {
+					trace!(
+						"register transient recv waker for {:?} on {:?}",
+						socket,
+						recv
+					);
+					self.get_mut(recv)
+						.map(|entry| entry.register_recv_waker(waker))
+						.unwrap_or_else(|_| warn!("registering send waker on unknown socket"));
+				}
+			})
+			.unwrap_or(());
+	}
 
 	/// close a socket by removing it's entry
 	/// cancelling the wake futures
@@ -181,7 +197,10 @@ impl SocketMap {
 		self.sockets
 			.get_mut(socket.id)
 			.and_then(Option::take)
-			.map(|entry| entry)
+			.map(|mut entry| {
+				entry.wake_tasks();
+				entry
+			})
 			.ok_or(io::Error::new(io::ErrorKind::NotFound, &"unknown socket"))
 	}
 
@@ -207,47 +226,61 @@ impl SocketMap {
 	) -> io::Result<()> {
 		let entry = self.get_mut(socket)?;
 		entry.insert_async_socket(async_socket);
+		entry.wake_tasks();
 		Ok(())
 	}
 
-	pub(crate) fn new_socket(&mut self, options: Options) -> Socket {
+	pub(crate) fn new_socket(
+		&mut self,
+		options: Options,
+	) -> (
+		Socket,
+		impl future::Future<Output = ()>,
+		impl future::Future<Output = ()>,
+	) {
 		// get a free entry
 		let socket = self.next_free_entry();
 		// spawn the waker futures for this entry
-		executor::spawn(future::poll_fn(move |cx| {
+		let send_future = future::poll_fn(move |cx| {
 			let mut sockets = lock();
 			if let Ok(entry) = sockets.get_mut(socket) {
+				if entry.closing {
+					return Poll::Ready(());
+				}
+				trace!("waking send for {:?}", socket);
 				entry.send_task_waker.register(cx.waker());
 				entry.wake_send();
-                sockets.register_wake_task_waker(socket,cx.waker(),poll::WakeOn::Send);
+				sockets.register_exclusive_waker(socket, cx.waker(), poll::WakeOn::Send);
 				Poll::Pending
 			} else {
-                // the entry was removed, so stop polling
 				Poll::Ready(())
 			}
-		}))
-		.detach();
-		executor::spawn(future::poll_fn(move |cx| {
+		});
+		let recv_future = future::poll_fn(move |cx| {
 			let mut sockets = lock();
 			if let Ok(entry) = sockets.get_mut(socket) {
+				if entry.closing {
+					return Poll::Ready(());
+				}
+				trace!("waking recv for {:?}", socket);
 				entry.recv_task_waker.register(cx.waker());
 				entry.wake_recv();
-                sockets.register_wake_task_waker(socket,cx.waker(),poll::WakeOn::Recv);
+				sockets.register_exclusive_waker(socket, cx.waker(), poll::WakeOn::Recv);
 				Poll::Pending
 			} else {
 				Poll::Ready(())
 			}
-		}))
-		.detach();
+		});
 		// insert the socket
 		let _ = self.sockets[socket.id].insert(SocketEntry {
 			async_socket: AsyncSocket::Unbound,
 			options,
+			closing: false,
 			send_task_waker: WakerRegistration::new(),
 			recv_task_waker: WakerRegistration::new(),
 			send_wakers: Vec::with_capacity(4),
 			recv_wakers: Vec::with_capacity(4),
 		});
-		socket
+		(socket, send_future, recv_future)
 	}
 }

@@ -1,58 +1,51 @@
-use crate::net::{nic,socket::HandleWrapper,poll::{Poll,PollSocketRaw,PollSocketsRaw,WakeOn}};
+use crate::net::{
+	nic,
+	poll::{Poll, PollSocketRaw, PollSocketsRaw, WakeOn},
+	socket::HandleWrapper,
+};
 use hermit_abi::io;
 use hermit_abi::net;
 use smoltcp::socket::TcpSocket;
 use smoltcp::wire::IpEndpoint;
-use std::task::Waker;
 use std::ops::Not;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Action {
-	/// currently listening
-	Listening,
-	/// currently connecting
-	Connecting,
-}
+use std::task::Waker;
 
 #[derive(Debug, Clone)]
 enum Inner {
-    Handle(HandleWrapper),
-    Backlog(Vec<HandleWrapper>),
+	Handle(HandleWrapper),
+	Backlog(Vec<HandleWrapper>),
 }
 
 impl Inner {
-    fn as_handle(&self) -> io::Result<&HandleWrapper> {
-        match self {
-            Self::Handle(handle) => Ok(handle),
-            Self::Backlog(_) => 
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    &"this socket is listening"
-                ))
-        }
-    }
+	fn as_handle(&self) -> io::Result<&HandleWrapper> {
+		match self {
+			Self::Handle(handle) => Ok(handle),
+			Self::Backlog(_) => Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				&"this socket is listening",
+			)),
+		}
+	}
 
-    fn as_backlog_ref(&self) -> io::Result<&Vec<HandleWrapper>> {
-        match self {
-            Self::Backlog(vec) => Ok(vec),
-            Self::Handle(inner) =>
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    &"this socket is not listening"
-                ))
-        }
-    }
+	fn as_backlog_ref(&self) -> io::Result<&Vec<HandleWrapper>> {
+		match self {
+			Self::Backlog(vec) => Ok(vec),
+			Self::Handle(_) => Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				&"this socket is not listening",
+			)),
+		}
+	}
 
-    fn as_backlog_mut(&mut self) -> io::Result<&mut Vec<HandleWrapper>> {
-        match self {
-            Self::Backlog(vec) => Ok(vec),
-            Self::Handle(inner) =>
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    &"this socket is not listening"
-                ))
-        }
-    }
+	fn as_backlog_mut(&mut self) -> io::Result<&mut Vec<HandleWrapper>> {
+		match self {
+			Self::Backlog(vec) => Ok(vec),
+			Self::Handle(_) => Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				&"this socket is not listening",
+			)),
+		}
+	}
 }
 
 /// Default keep alive interval in milliseconds
@@ -64,122 +57,134 @@ pub(crate) struct AsyncTcpSocket {
 	inner: Inner,
 	/// the bound local endpoint
 	local: IpEndpoint,
-    /// wheter write() is allowed
-    ///
-    /// since shutdown() waits for remaining packets
-    /// by the tcp statemachine writeable socket
-    /// may not allow writing since closing is in progress
-    allow_write: bool,
-    /// wheter read() is allowed
-    ///
-    /// since shutdown() can not actually influence the read
-    /// behaviour of a socket (only the peer can close the connection) 
-    /// this option inhibits reads after shutdown has been called
-    allow_read: bool,
-    /// the associated socket in the socket_map
-    in_progress: Option<Action>,
+	/// wheter write() is allowed
+	///
+	/// since shutdown() waits for remaining packets
+	/// by the tcp statemachine writeable socket
+	/// may not allow writing since closing is in progress
+	allow_write: bool,
+	/// wheter read() is allowed
+	///
+	/// since shutdown() can not actually influence the read
+	/// behaviour of a socket (only the peer can close the connection)
+	/// this option inhibits reads after shutdown has been called
+	allow_read: bool,
 }
 
 impl super::Socket for AsyncTcpSocket {
-	fn register_send_waker(&mut self, waker: &Waker) -> Option<(Vec<net::Socket>,Vec<net::Socket>)> {
-		nic::lock().with(|nic| {
-            match self.inner {
-			    Inner::Handle(ref handle) => nic.with_mut(handle, |tcp_socket: &mut TcpSocket|
-				    tcp_socket.register_send_waker(waker)),
-			    Inner::Backlog(ref backlog) => 
-                    for handle in backlog {
-                        nic.with_mut(handle, |tcp_socket: &mut TcpSocket|
-				            tcp_socket.register_send_waker(waker))
-                    },
-            }
+	fn register_exclusive_send_waker(
+		&mut self,
+		waker: &Waker,
+	) -> Option<(Vec<net::Socket>, Vec<net::Socket>)> {
+		nic::lock().with(|nic| match self.inner {
+			Inner::Handle(ref handle) => nic.with_mut(handle, |tcp_socket: &mut TcpSocket| {
+				tcp_socket.register_send_waker(waker)
+			}),
+			Inner::Backlog(ref backlog) => {
+				for handle in backlog.iter() {
+					nic.with_mut(handle, |tcp_socket: &mut TcpSocket| {
+						tcp_socket.register_send_waker(waker)
+					})
+				}
+			}
 		});
-        None
+		None
 	}
 
-	fn register_recv_waker(&mut self, waker: &Waker) -> Option<(Vec<net::Socket>,Vec<net::Socket>)> {
-		nic::lock().with(|nic| {
-            match self.inner {
-			    Inner::Handle(ref handle) => nic.with_mut(handle, |tcp_socket: &mut TcpSocket|
-				    tcp_socket.register_send_waker(waker)),
-			    Inner::Backlog(ref backlog) => 
-                    for handle in backlog {
-                        nic.with_mut(handle, |tcp_socket: &mut TcpSocket|
-				            tcp_socket.register_send_waker(waker))
-                    },
-            }
+	fn register_exclusive_recv_waker(
+		&mut self,
+		waker: &Waker,
+	) -> Option<(Vec<net::Socket>, Vec<net::Socket>)> {
+		nic::lock().with(|nic| match self.inner {
+			Inner::Handle(ref handle) => nic.with_mut(handle, |tcp_socket: &mut TcpSocket| {
+				tcp_socket.register_recv_waker(waker)
+			}),
+			Inner::Backlog(ref backlog) => {
+				for handle in backlog.iter() {
+					nic.with_mut(handle, |tcp_socket: &mut TcpSocket| {
+						tcp_socket.register_recv_waker(waker)
+					})
+				}
+			}
 		});
-        None
+		None
 	}
 
 	fn get_event_flags(&mut self) -> net::event::EventFlags {
-        use net::event::EventFlags;
-        nic::lock().with(|nic| match self.inner {
-            Inner::Handle(ref handle) => nic.with_ref(handle,|tcp: &TcpSocket| {
-                let mut flags = EventFlags::NONE;
-                if tcp.can_send() {
-                    flags |= EventFlags::WRITABLE;
-                } else if !self.allow_write || !tcp.may_send() {
-                    flags |= EventFlags::WCLOSED;
-                }
-                if tcp.can_recv() {
-                    flags |= EventFlags::READABLE;
-                } else if !self.allow_read || !tcp.may_recv() {
-                    flags |= EventFlags::WCLOSED;
-                }
-                EventFlags(flags)
-            }),
-            Inner::Backlog(ref backlog) => {
-                backlog
-                    .iter()
-                    .any(|handle| nic.with_ref(handle,|tcp: &TcpSocket| {
-                        tcp.is_active()   
-                    }))
-                .then(|| 
-                    EventFlags(EventFlags::WRITABLE))
-                .unwrap_or(
-                    EventFlags(EventFlags::NONE))
-            },
-        })
+		use net::event::EventFlags;
+		nic::lock().with(|nic| match self.inner {
+			Inner::Handle(ref handle) => nic.with_ref(handle, |tcp: &TcpSocket| {
+				let mut flags = EventFlags::NONE;
+				if tcp.can_send() {
+					flags |= EventFlags::WRITABLE;
+				} else if !self.allow_write && !tcp.may_send() {
+					flags |= EventFlags::WCLOSED;
+				}
+				if tcp.can_recv() {
+					flags |= EventFlags::READABLE;
+				} else if !self.allow_read && !tcp.may_recv() {
+					flags |= EventFlags::RCLOSED;
+				}
+				EventFlags(flags)
+			}),
+			Inner::Backlog(ref backlog) => backlog
+				.iter()
+				.any(|handle| nic.with_ref(handle, |tcp: &TcpSocket| tcp.is_active()))
+				.then(|| EventFlags(EventFlags::READABLE))
+				.unwrap_or(EventFlags(EventFlags::NONE)),
+		})
 	}
 
-    fn may_close(&self) -> bool {
-        self.has_remaining_packets()
-            .map(bool::not)
-            .unwrap_or(true)
-    }
+	fn may_close(&self) -> bool {
+		self.has_remaining_packets().map(bool::not).unwrap_or(true)
+	}
 
-    fn close(&mut self) {
-        self.rclose();
-        self.wclose();
-    }
+	fn init_close(&mut self) {
+		// forbid further read or write operations
+		self.rclose();
+		self.wclose();
+	}
+
+	fn close(&mut self) {
+		self.with_socket_mut(|tcp| {
+			Ok({
+				tcp.close();
+				//tcp.abort();
+			})
+		})
+		.unwrap_or(());
+	}
 }
 
 impl AsyncTcpSocket {
-	pub(crate) fn new(local: IpEndpoint) -> Self {
-        let handle = nic::lock()
-            .with(|nic| nic.create_tcp_handle());
+	pub(crate) fn new(mut local: IpEndpoint) -> Self {
+		let handle = nic::lock().with(|nic| nic.create_tcp_handle());
+
+		if local.port == 0 {
+			local.port = crate::net::local_endpoint();
+		}
+
 		Self {
-		    inner: Inner::Handle(handle),
+			inner: Inner::Handle(handle),
 			local,
-            allow_read: true,
-            allow_write: true,
-            in_progress: None,
+			allow_read: true,
+			allow_write: true,
 		}
 	}
 
-	pub(crate) fn poll_socket<F,T>(&self, f: F) -> io::Result<PollSocketRaw<F>>
-    where
-        F: FnMut(&TcpSocket) -> Poll<io::Result<T>>,
-    {
-        Ok(PollSocketRaw::new(self.inner.as_handle()?.clone(),f))
-    }
+	pub(crate) fn poll_socket<F, T>(&self, f: F) -> io::Result<PollSocketRaw<F>>
+	where
+		F: FnMut(&TcpSocket) -> Poll<io::Result<T>>,
+	{
+		Ok(PollSocketRaw::new(self.inner.as_handle()?.clone(), f))
+	}
 
-	pub(crate) fn poll_sockets<F,T>(&self, f: F) -> io::Result<PollSocketsRaw<F>>
-    where
-        F: FnMut(&TcpSocket) -> Poll<io::Result<T>>,
-    {
-        Ok(PollSocketsRaw::new(self.inner.as_backlog_ref()?.clone(),f))
-    }
+	pub(crate) fn poll_sockets<F, T>(&self, f: F) -> io::Result<PollSocketsRaw<F>>
+	where
+		F: FnMut(&TcpSocket) -> Poll<io::Result<T>>,
+	{
+		Ok(PollSocketsRaw::new(self.inner.as_backlog_ref()?.clone(), f))
+	}
 
 	/// call a closure with a reference to the corresponding socket in the nic
 	///
@@ -188,8 +193,7 @@ impl AsyncTcpSocket {
 	where
 		F: FnOnce(&TcpSocket) -> io::Result<T>,
 	{
-		nic::lock().with(|nic| 
-            nic.with_ref(self.inner.as_handle()?, f))
+		nic::lock().with(|nic| nic.with_ref(self.inner.as_handle()?, f))
 	}
 
 	/// call a closure with a reference to the corresponding socket in the nic
@@ -210,283 +214,261 @@ impl AsyncTcpSocket {
 	}
 
 	pub(crate) fn wclose(&mut self) {
-        self.allow_write = false;
+		self.allow_write = false;
 	}
 
 	pub(crate) fn rclose(&mut self) {
-        self.allow_read = false;
+		self.allow_read = false;
 	}
 
 	pub(crate) fn read(&mut self, buffer: &mut [u8], peek: bool) -> io::Result<Option<usize>> {
 		if !self.allow_read {
-            Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                &"the sockets read side is closed",
-            ))
-		} else {
-            self.with_socket_mut(|tcp| match tcp {
-                tcp if tcp.can_recv() => tcp
-                        .recv(|data| {
-                            let len = std::cmp::min(data.len(),buffer.len());
-                            buffer[..len].copy_from_slice(&data[..len]);
-                            (
-                                if peek { 0 } else { len },
-                                Some(len)
-                            )
-                        })
-                        .map_err(|_err|
-                            io::Error::new(
-                                io::ErrorKind::NotConnected,
-                                &"the sockets read side is closed",
-                            )),
-                tcp if !tcp.may_recv() =>
-                    Err(io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        &"the sockets read side is closed",
-                    )),
-                _ => Ok(None),
-            })
-        }
-	}
-	
-	pub(crate) fn write(&mut self, buffer: &[u8]) -> io::Result<Option<usize>> {
-		if !self.allow_write {
-            Err(io::Error::new(
+			Err(io::Error::new(
 				io::ErrorKind::NotConnected,
 				&"the sockets read side is closed",
 			))
 		} else {
-            self.with_socket_mut(|tcp| match tcp {
-                tcp if tcp.can_recv() => tcp
-                    .send_slice(buffer)
-                    .map(Some)
-                    .map_err(|_err| io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        &"the sockets read side is closed",
-                    )),
-                tcp if !tcp.may_recv() =>
-                    Err(io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        &"the sockets read side is closed",
-                    )),
-                _ => Ok(None),
-            })
-        }
+			self.with_socket_mut(|tcp| match tcp {
+				tcp if tcp.can_recv() => tcp
+					.recv(|data| {
+						let len = std::cmp::min(data.len(), buffer.len());
+						buffer[..len].copy_from_slice(&data[..len]);
+						(if peek { 0 } else { len }, Some(len))
+					})
+					.map_err(|_err| {
+						io::Error::new(
+							io::ErrorKind::NotConnected,
+							&"the sockets read side is closed",
+						)
+					}),
+				tcp if !tcp.may_recv() => Ok(Some(0)),
+				_ => Ok(None),
+			})
+		}
 	}
 
-    pub(crate) fn accept(&mut self,) -> io::Result<Option<AsyncTcpSocket>> {
-        let local = self.local;
-        let backlog = self.inner.as_backlog_mut()?;
-        let mut index = None;
+	pub(crate) fn write(&mut self, buffer: &[u8]) -> io::Result<Option<usize>> {
+		if !self.allow_write {
+			Err(io::Error::new(
+				io::ErrorKind::NotConnected,
+				&"the sockets write side is closed",
+			))
+		} else {
+			self.with_socket_mut(|tcp| match tcp {
+				tcp if tcp.can_send() => tcp.send_slice(buffer).map(Some).map_err(|_err| {
+					io::Error::new(
+						io::ErrorKind::NotConnected,
+						&"the sockets write side is closed",
+					)
+				}),
+				tcp if !tcp.may_send() => Err(io::Error::new(
+					io::ErrorKind::NotConnected,
+					&"the sockets write side is closed",
+				)),
+				_ => Ok(None),
+			})
+		}
+	}
 
-        nic::lock().with(|nic| {
-            for (i,h) in backlog.iter().enumerate() {
-                nic.with_ref(h,|tcp: &TcpSocket| {
-                    if tcp.may_recv() && tcp.may_send() {
-                        index = Some(i);
-                    }
-                })
-            }
-        });
+	pub(crate) fn accept(&mut self) -> io::Result<Option<AsyncTcpSocket>> {
+		let local = self.local;
+		let backlog = self.inner.as_backlog_mut()?;
+		let mut index = None;
 
-        if let Some(index) = index {
-            let handle = backlog.remove(index);
-            let new = Self::duplicate_handle(&handle);
-            nic::lock().with(|nic| 
-                nic.with_mut(&new,|tcp: &mut TcpSocket| 
-                    tcp.listen(local)));
-            backlog.push(new);
-            Ok(Some(Self {
-                inner: Inner::Handle(handle),
-                local,
-                allow_write: true,
-                allow_read: true,
-                in_progress: None,
-            }))
-        } else {
-            Ok(None)
-        }
-    }
+		nic::lock().with(|nic| {
+			for (i, h) in backlog.iter().enumerate() {
+				nic.with_ref(h, |tcp: &TcpSocket| {
+					if tcp.may_recv() && tcp.may_send() {
+						index = Some(i);
+					}
+				})
+			}
+		});
 
-    pub(crate) fn set_hop_limit(&mut self, hop_limit: Option<u8>) -> io::Result<()> {
-        self.with_socket_mut(|tcp| Ok(
-            tcp.set_hop_limit(hop_limit)))
-    }
+		if let Some(index) = index {
+			let handle = backlog.remove(index);
+			let new = Self::duplicate_handle(&handle);
+			nic::lock()
+				.with(|nic| nic.with_mut(&new, |tcp: &mut TcpSocket| tcp.listen(local).unwrap()));
+			backlog.push(new);
+			Ok(Some(Self {
+				inner: Inner::Handle(handle),
+				local,
+				allow_write: true,
+				allow_read: true,
+			}))
+		} else {
+			Ok(None)
+		}
+	}
 
-    pub(crate) fn hop_limit(&self) -> io::Result<Option<u8>> {
-        self.with_socket_ref(|tcp| Ok(
-            tcp.hop_limit()))
-    }
+	pub(crate) fn set_hop_limit(&mut self, hop_limit: Option<u8>) -> io::Result<()> {
+		self.with_socket_mut(|tcp| Ok(tcp.set_hop_limit(hop_limit)))
+	}
 
-    pub(crate) fn local_addr(&self) -> IpEndpoint {
-        self.local
-    }
+	pub(crate) fn hop_limit(&self) -> io::Result<Option<u8>> {
+		self.with_socket_ref(|tcp| Ok(tcp.hop_limit()))
+	}
 
-    pub(crate) fn connect(&mut self, remote: IpEndpoint) 
-        -> io::Result<PollSocketRaw<impl FnMut(&TcpSocket) -> Poll<io::Result<()>>>> 
-    {
-        let local = self.local;
-        self
-            .with_socket_mut(|tcp| match tcp {
-                tcp if tcp.is_active() 
-                    && tcp.remote_endpoint().is_specified() 
-                    && tcp.remote_endpoint() == remote  =>
-                    Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,    
-                        &"already connecting to another remote"
-                    )),
-                tcp if tcp.is_active() 
-                    && tcp.remote_endpoint().is_specified() =>
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,    
-                        &"already in use",
-                    )),
-                tcp if tcp.is_active() => 
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,    
-                        &"already in use",
-                    )),
-                _ => tcp
-                    .connect(remote,local)
-                    .map_err(|_err| io::Error::new(
-                        io::ErrorKind::InvalidData,    
-                        &"invalid remote",
-                    )),
-            })
-            .and_then(|()| self.poll_connected())
-    }
+	pub(crate) fn local_addr(&self) -> IpEndpoint {
+		self.local
+	}
 
+	pub(crate) fn connect(
+		&mut self,
+		remote: IpEndpoint,
+	) -> io::Result<PollSocketRaw<impl FnMut(&TcpSocket) -> Poll<io::Result<()>>>> {
+		let local = self.local;
+		self.with_socket_mut(|tcp| match tcp {
+			tcp if tcp.is_active()
+				&& tcp.remote_endpoint().is_specified()
+				&& tcp.remote_endpoint() == remote =>
+			{
+				Ok(())
+			}
+			tcp if tcp.is_active() && tcp.remote_endpoint().is_specified() => Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				&"already in use",
+			)),
+			tcp if tcp.is_open() => Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				&"already in use",
+			)),
+			_ => tcp
+				.connect(remote, local)
+				.map_err(|_err| io::Error::new(io::ErrorKind::InvalidData, &"invalid remote")),
+		})
+		.and_then(|()| self.poll_connected())
+	}
 
-    pub(crate) fn listen(&mut self, backlog: usize) -> io::Result<()> {
-        let local = self.local;
-        let vec = match self.inner {
-            Inner::Backlog(_) => return 
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,    
-                    &"already listening"
-                )),
-            Inner::Handle(ref handle) => {
-                if nic::lock()
-                    .with(|nic| nic.with_ref(handle,|tcp: &TcpSocket| 
-                        tcp.is_open())) 
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,    
-                        &"already open",
-                    ))
-                } else {
-                    (0..backlog)
-                        .map(|_| Self::duplicate_handle(handle))
-                        .collect()
-                }
-            }
-        };
-        for handle in &vec {
-            nic::lock()
-                .with(|nic| nic.with_mut(handle,|tcp: &mut TcpSocket| 
-                    tcp.listen(local)));
-        }
-        self.inner = Inner::Backlog(vec);
-        Ok(())
-    }
+	pub(crate) fn listen(&mut self, backlog: usize) -> io::Result<()> {
+		let local = self.local;
+		trace!("listen on {:?}", local);
+		let vec = match self.inner {
+			Inner::Backlog(_) => {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidInput,
+					&"already listening",
+				))
+			}
+			Inner::Handle(ref handle) => {
+				if nic::lock().with(|nic| nic.with_ref(handle, |tcp: &TcpSocket| tcp.is_open())) {
+					return Err(io::Error::new(io::ErrorKind::InvalidInput, &"already open"));
+				} else {
+					(0..backlog)
+						.map(|_| Self::duplicate_handle(handle))
+						.collect()
+				}
+			}
+		};
+		for handle in &vec {
+			nic::lock()
+				.with(|nic| nic.with_mut(handle, |tcp: &mut TcpSocket| tcp.listen(local).unwrap()));
+		}
+		self.inner = Inner::Backlog(vec);
+		Ok(())
+	}
 
-    pub(crate) fn remote_addr(&self) -> io::Result<IpEndpoint> {
-        self.with_socket_ref(|tcp| {
-            if tcp.is_active() {
-                Ok(tcp.remote_endpoint())
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    &"no endpoint available",
-                ))
-            }
-        })
-    }
+	pub(crate) fn remote_addr(&self) -> io::Result<IpEndpoint> {
+		self.with_socket_ref(|tcp| {
+			if tcp.is_active() {
+				Ok(tcp.remote_endpoint())
+			} else {
+				Err(io::Error::new(
+					io::ErrorKind::NotConnected,
+					&"no endpoint available",
+				))
+			}
+		})
+	}
 
-    pub(crate) fn poll_incoming_connection(&self) 
-        -> io::Result<PollSocketsRaw<impl FnMut(&TcpSocket) -> Poll<io::Result<()>>>> 
-    {
-        self.poll_sockets(|tcp| {
-            if tcp.may_recv() && tcp.may_send() {
-                Poll::Ready(Ok(()))
-            } else if !tcp.is_active() {
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    &"connection refused",
-                )))
-            } else {
-                Poll::Pending(WakeOn::Send)
-            }
-        })
-    }
+	pub(crate) fn poll_incoming_connection(
+		&self,
+	) -> io::Result<PollSocketsRaw<impl FnMut(&TcpSocket) -> Poll<io::Result<()>>>> {
+		self.poll_sockets(|tcp| {
+			if tcp.may_recv() && tcp.may_send() {
+				trace!("found incoming connection");
+				Poll::Ready(Ok(()))
+			} else if !tcp.is_open() {
+				warn!("incoming connection reset");
+				Poll::Ready(Err(io::Error::new(
+					io::ErrorKind::ConnectionReset,
+					&"connection reset",
+				)))
+			} else {
+				Poll::Pending(WakeOn::SendRecv)
+			}
+		})
+	}
 
-    pub(crate) fn poll_connected(&self)
-        -> io::Result<PollSocketRaw<impl FnMut(&TcpSocket) -> Poll<io::Result<()>>>> 
-    {
-        self.poll_socket(|tcp| {
-            if tcp.may_recv() && tcp.may_send() {
-                Poll::Ready(Ok(()))
-            } else if !tcp.is_active() {
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    &"connection refused",
-                )))
-            } else {
-                Poll::Pending(WakeOn::Send)
-            }
-        })
-    }
+	pub(crate) fn poll_connected(
+		&self,
+	) -> io::Result<PollSocketRaw<impl FnMut(&TcpSocket) -> Poll<io::Result<()>>>> {
+		self.poll_socket(|tcp| {
+			debug!("poll_connected. State: {:?}", tcp.state());
+			if tcp.may_recv() && tcp.may_send() {
+				Poll::Ready(Ok(()))
+			} else if !tcp.is_active() {
+				Poll::Ready(Err(io::Error::new(
+					io::ErrorKind::NotConnected,
+					&"connection refused",
+				)))
+			} else {
+				Poll::Pending(WakeOn::Send)
+			}
+		})
+	}
 
-    pub(crate) fn poll_readable(&self)
-        -> io::Result<PollSocketRaw<impl FnMut(&TcpSocket) -> Poll<io::Result<()>>>> 
-    {
-        self.poll_socket(|tcp| {
-            if tcp.may_recv() {
-                Poll::Ready(Ok(()))
-            } else if !tcp.is_active() {
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    &"not connected",
-                )))
-            } else {
-                Poll::Pending(WakeOn::Recv)
-            }
-        })
-    }
+	pub(crate) fn poll_readable(
+		&self,
+	) -> io::Result<PollSocketRaw<impl FnMut(&TcpSocket) -> Poll<io::Result<()>>>> {
+		self.poll_socket(|tcp| {
+			if tcp.can_recv() {
+				Poll::Ready(Ok(()))
+			} else if !tcp.is_active() {
+				Poll::Ready(Err(io::Error::new(
+					io::ErrorKind::NotConnected,
+					&"not connected",
+				)))
+			} else {
+				Poll::Pending(WakeOn::Recv)
+			}
+		})
+	}
 
-    pub(crate) fn poll_writable(&self)
-        -> io::Result<PollSocketRaw<impl FnMut(&TcpSocket) -> Poll<io::Result<()>>>> 
-    {
-        self.poll_socket(|tcp| {
-            if tcp.may_send() {
-                Poll::Ready(Ok(()))
-            } else if !tcp.is_active() {
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    &"not connected",
-                )))
-            } else {
-                Poll::Pending(WakeOn::Send)
-            }
-        })
-    }
+	pub(crate) fn poll_writable(
+		&self,
+	) -> io::Result<PollSocketRaw<impl FnMut(&TcpSocket) -> Poll<io::Result<()>>>> {
+		self.poll_socket(|tcp| {
+			if tcp.can_send() {
+				Poll::Ready(Ok(()))
+			} else if !tcp.is_active() {
+				Poll::Ready(Err(io::Error::new(
+					io::ErrorKind::NotConnected,
+					&"not connected",
+				)))
+			} else {
+				Poll::Pending(WakeOn::Send)
+			}
+		})
+	}
 
-    pub(crate) fn has_remaining_packets(&self) -> io::Result<bool> {
-        self.with_socket_ref(|tcp| Ok(
-            if tcp.may_send() && tcp.send_queue() > 0 {
-                true
-            } else {
-                false
-            }
-        ))
-    }
+	pub(crate) fn has_remaining_packets(&self) -> io::Result<bool> {
+		self.with_socket_ref(|tcp| {
+			Ok(if tcp.may_send() && tcp.send_queue() > 0 {
+				true
+			} else {
+				false
+			})
+		})
+	}
 
 	fn duplicate_handle(handle: &HandleWrapper) -> HandleWrapper {
-        nic::lock().with(|nic| {
-            let new = nic.create_tcp_handle();
-            let hop_limit = nic.with_ref(handle,|tcp: &TcpSocket| tcp.hop_limit());
-            nic.with_mut(&new,|tcp: &mut TcpSocket| tcp.set_hop_limit(hop_limit));
-            new
-        })
+		nic::lock().with(|nic| {
+			let new = nic.create_tcp_handle();
+			let hop_limit = nic.with_ref(handle, |tcp: &TcpSocket| tcp.hop_limit());
+			nic.with_mut(&new, |tcp: &mut TcpSocket| tcp.set_hop_limit(hop_limit));
+			new
+		})
 	}
 }

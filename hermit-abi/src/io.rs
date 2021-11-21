@@ -3,7 +3,7 @@ pub type Result<T> = core::result::Result<T, Error>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error {
 	pub kind: ErrorKind,
-    // make it a thin pointer
+	// make it a thin pointer
 	pub msg: &'static &'static str,
 }
 

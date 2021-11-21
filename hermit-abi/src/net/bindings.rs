@@ -26,10 +26,10 @@ extern "Rust" {
 
 	// TCP
 	fn sys_tcp_bind(socket: Socket, local: SocketAddr) -> Result<()>;
-    fn sys_tcp_set_hop_limit(socket: Socket, hop_limit: Option<u8>) -> Result<()>;
-    fn sys_tcp_hop_limit(socket: Socket) -> Result<Option<u8>>;
-    fn sys_tcp_local_addr(socket: Socket) -> Result<SocketAddr>;
-    fn sys_tcp_remote_addr(socket: Socket) -> Result<SocketAddr>;
+	fn sys_tcp_set_hop_limit(socket: Socket, hop_limit: Option<u8>) -> Result<()>;
+	fn sys_tcp_hop_limit(socket: Socket) -> Result<Option<u8>>;
+	fn sys_tcp_local_addr(socket: Socket) -> Result<SocketAddr>;
+	fn sys_tcp_remote_addr(socket: Socket) -> Result<SocketAddr>;
 	fn sys_tcp_listen(socket: Socket, backlog: usize) -> Result<()>;
 	fn sys_tcp_accept(socket: Socket) -> Result<Socket>;
 	fn sys_tcp_connect(socket: Socket, remote: SocketAddr) -> Result<()>;
@@ -104,19 +104,19 @@ pub fn tcp_bind(socket: Socket, addr: SocketAddr) -> Result<()> {
 }
 
 pub fn tcp_set_hop_limit(socket: Socket, hop_limit: Option<u8>) -> Result<()> {
-    unsafe { sys_tcp_set_hop_limit(socket, hop_limit) }
+	unsafe { sys_tcp_set_hop_limit(socket, hop_limit) }
 }
 
 pub fn tcp_hop_limit(socket: Socket) -> Result<Option<u8>> {
-    unsafe { sys_tcp_hop_limit(socket) }
+	unsafe { sys_tcp_hop_limit(socket) }
 }
 
 pub fn tcp_local_addr(socket: Socket) -> Result<SocketAddr> {
-    unsafe { sys_tcp_local_addr(socket) }
+	unsafe { sys_tcp_local_addr(socket) }
 }
 
 pub fn tcp_remote_addr(socket: Socket) -> Result<SocketAddr> {
-    unsafe { sys_tcp_remote_addr(socket) }
+	unsafe { sys_tcp_remote_addr(socket) }
 }
 
 pub fn tcp_listen(socket: Socket, backlog: usize) -> Result<()> {

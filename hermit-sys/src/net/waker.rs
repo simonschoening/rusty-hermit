@@ -2,7 +2,7 @@
 use core::task::Waker;
 
 /// Utility struct to register and wake a waker.
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct WakerRegistration {
 	waker: Option<Waker>,
 }
@@ -31,7 +31,7 @@ impl WakerRegistration {
 					//
 					// If the user wants to have two tasks waiting on the same thing they should use
 					// a more appropriate primitive that can store multiple wakers.
-					old_waker.wake()
+					//					old_waker.wake()
 				}
 			}
 		}
