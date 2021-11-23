@@ -57,6 +57,7 @@ extern "C" {
 	fn sys_unlink(name: *const i8) -> i32;
 	fn sys_network_init() -> i32;
 	fn sys_block_current_task();
+	fn sys_block_current_task_with_timeout(timeout: u64);
 	fn sys_wakeup_task(tid: Tid);
 	fn sys_get_priority() -> u8;
 }
@@ -383,6 +384,12 @@ pub unsafe fn secure_rand64() -> Option<u64> {
 #[inline(always)]
 pub unsafe fn block_current_task() {
 	sys_block_current_task();
+}
+
+/// Like `block_current_task` but reschedules the task after the timeout (in ms) expired
+#[inline(always)]
+pub unsafe fn block_current_task_with_timeout(timeout: u64) {
+	sys_block_current_task_with_timeout(timeout);
 }
 
 /// Wakeup task with the thread id `tid`
