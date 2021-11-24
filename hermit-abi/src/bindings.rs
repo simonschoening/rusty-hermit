@@ -60,6 +60,8 @@ extern "C" {
 	fn sys_block_current_task_with_timeout(timeout: u64);
 	fn sys_wakeup_task(tid: Tid);
 	fn sys_get_priority() -> u8;
+	fn sys_irq_enable();
+	fn sys_irq_disable() -> bool;
 }
 
 /// returns true if file descriptor `fd` is a tty
@@ -379,7 +381,7 @@ pub unsafe fn secure_rand64() -> Option<u64> {
 	sys_secure_rand64()
 }
 
-/// Add current task to the queue of blocked tasl. After calling `block_current_task`,
+/// Add current task to the queue of blocked task. After calling `block_current_task`,
 /// call `yield_now` to switch to another task.
 #[inline(always)]
 pub unsafe fn block_current_task() {
@@ -402,4 +404,16 @@ pub unsafe fn wakeup_task(tid: Tid) {
 #[inline(always)]
 pub unsafe fn get_priority() -> Priority {
 	Priority::from(sys_get_priority())
+}
+
+/// 
+#[inline(always)]
+pub unsafe fn irq_enable() {
+	sys_irq_enable();
+}
+
+/// Determine the priority of the current thread
+#[inline(always)]
+pub unsafe fn irq_disable() -> bool {
+	sys_irq_disable()
 }
