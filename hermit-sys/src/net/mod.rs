@@ -1,3 +1,5 @@
+#[cfg(target_arch = "riscv64")]
+use riscv::register::time;
 pub mod device;
 pub mod executor;
 pub mod nic;
@@ -331,6 +333,11 @@ pub fn sys_waker_bind(socket: abi::Socket) -> io::Result<()> {
 	socket_map::lock().bind_socket(socket, socket::AsyncWakerSocket::new(None).into())?;
 	run_executor();
 	Ok(())
+}
+
+#[cfg(target_arch = "riscv64")]
+fn start_endpoint() -> u16 {
+	(time::read64() % (u16::MAX as u64)).try_into().unwrap()
 }
 
 #[no_mangle]

@@ -50,6 +50,9 @@ default-features = false
 version = "0.*"
 default-features = false
 
+[target.'cfg(target_arch = "riscv64")'.dependencies.riscv]
+version = "0.6.0"
+
 [dependencies.smoltcp]
 version = "0.7.0"
 optional = true
@@ -62,4 +65,7 @@ features = ["std", "ethernet", "socket-udp", "socket-tcp", "proto-ipv4", "proto-
 version = "0.1.0"
 optional = true
 features = ["autokernel", "buildcore", "interruptsafe"]
+
+[patch.crates-io]
+riscv = { git = "https://github.com/simonschoening/riscv.git" }
 

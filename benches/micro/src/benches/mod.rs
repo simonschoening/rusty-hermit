@@ -12,8 +12,10 @@ use std::str;
 use std::thread;
 use std::time::Instant;
 use std::vec;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_arch = "riscv64")))]
 use syscalls::SYS_getpid;
+#[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+const SYS_GETPID: u64 = 172;
 
 extern "C" {
 	pub fn memcpy(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
@@ -39,6 +41,19 @@ fn get_timestamp() -> u64 {
 	CNTPCT_EL0.get()
 }
 
+#[cfg(target_arch = "riscv64")]
+#[inline]
+fn get_timestamp() -> u64 {
+	let time: u64;
+	unsafe {
+		asm!(
+			"rdcycle {time}",
+			time = out(reg) time
+		);
+	}
+	time
+}
+
 extern "C" {
 	#[cfg(target_os = "hermit")]
 	fn sys_getpid() -> u32;
@@ -51,16 +66,26 @@ pub fn bench_syscall() -> Result<(), ()> {
 		// cache warmup
 		#[cfg(target_os = "hermit")]
 		let _ = sys_getpid();
-		#[cfg(target_os = "linux")]
+		#[cfg(all(target_os = "linux", not(target_arch = "riscv64")))]
 		let _ = syscall!(SYS_getpid);
+		#[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+		asm!(
+			"ecall",
+			in("a7") SYS_GETPID
+		);
 		let _ = get_timestamp();
 
 		let start = get_timestamp();
 		for _ in 0..n {
 			#[cfg(target_os = "hermit")]
 			let _ = sys_getpid();
-			#[cfg(target_os = "linux")]
+			#[cfg(all(target_os = "linux", not(target_arch = "riscv64")))]
 			let _ = syscall!(SYS_getpid);
+			#[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+			asm!(
+				"ecall",
+				in("a7") SYS_GETPID
+			);
 		}
 		get_timestamp() - start
 	};
