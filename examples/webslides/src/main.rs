@@ -11,12 +11,12 @@ struct Slides;
 fn main() {
 	println!("Now listening on port 8000");
 
-	rouille::start_server("0.0.0.0:8000", |request| {
+	rouille::start_server("0.0.0.0:8000", move |request| {
 		let path = request.url();
 		println!("Request {}", path);
 
 		match path.as_str() {
-			"/" => Slides::get("examples/media.html")
+			"/" => Slides::get("rwth.html")
 				.map(|index| Response::from_data("text/html", index.data.as_ref())),
 			_ => Slides::get(path.strip_prefix('/').unwrap()).map(|index| {
 				Response::from_data(
