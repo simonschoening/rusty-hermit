@@ -29,6 +29,8 @@ use smoltcp::wire::{IpCidr, Ipv4Address, Ipv4Cidr};
 use smoltcp::Error;
 #[cfg(target_arch = "aarch64")]
 use tock_registers::interfaces::Readable;
+#[cfg(target_arch = "riscv64")]
+use core::arch::asm;
 
 use crate::net::device::HermitNet;
 use crate::net::executor::{block_on, poll_on, spawn};
@@ -350,6 +352,18 @@ fn start_endpoint() -> u16 {
 #[cfg(target_arch = "aarch64")]
 fn start_endpoint() -> u16 {
 	(CNTPCT_EL0.get() % (u16::MAX as u64)).try_into().unwrap()
+}
+
+#[cfg(target_arch = "riscv64")]
+fn start_endpoint() -> u16 {
+	let time: u64;
+	unsafe {
+		asm!(
+			"rdcycle {time}",
+			time = out(reg) time
+		);
+	}
+	(time % (u16::MAX as u64)).try_into().unwrap()
 }
 
 pub(crate) fn network_delay(timestamp: Instant) -> Option<Duration> {

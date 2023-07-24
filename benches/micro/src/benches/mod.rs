@@ -10,6 +10,7 @@ use std::str;
 use std::thread;
 use std::time::Instant;
 use std::vec;
+use std::arch::asm;
 
 extern "C" {
 	pub fn memcpy(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
@@ -35,6 +36,19 @@ fn get_timestamp() -> u64 {
 	use tock_registers::interfaces::Readable;
 
 	aarch64::regs::CNTPCT_EL0.get()
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline]
+fn get_timestamp() -> u64 {
+	let time: u64;
+	unsafe {
+		asm!(
+			"rdcycle {time}",
+			time = out(reg) time
+		);
+	}
+	time
 }
 
 extern "C" {

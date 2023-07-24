@@ -7,7 +7,7 @@ extern crate log;
 mod cmath;
 #[cfg(not(feature = "tcp"))]
 mod dummy;
-#[cfg(feature = "tcp")]
+#[cfg(any(feature = "tcp", target_arch = "riscv64"))]
 mod net;
 
 use log::{set_logger, set_max_level, LevelFilter, Metadata, Record};

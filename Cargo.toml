@@ -9,3 +9,6 @@ members = [
     "examples/demo",
 ]
 exclude = ["target", "loader", "libhermit-rs"]
+
+[patch.crates-io]
+num_cpus = { git = "https://github.com/simonschoening/num_cpus.git" }
